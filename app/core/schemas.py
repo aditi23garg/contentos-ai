@@ -1,0 +1,127 @@
+"""
+Core data models for ContentOS AI.
+
+These map directly to the entities defined in the v2.3 specification:
+- BrandProfile        -> "Brand Memory — versioned"
+- Idea                 -> "Content Batching" + "Workflow Memory" (reasoning captured at selection time)
+- GeneratedContent     -> "Content Producer Agent" output
+- RubricScores / BrandGuardianResult -> "Content Quality Check — extended scored rubric"
+
+Kept deliberately small for the first runnable slice (Research -> Content Producer ->
+Brand Guardian). Fields for Phase 2/3 (scheduling, analytics, feedback) are noted as
+TODOs where relevant rather than built out prematurely, per the spec's own philosophy.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Optional
+
+from pydantic import BaseModel, Field
+
+
+class BrandProfile(BaseModel):
+    """A single versioned snapshot of the brand. Never mutate in place — create a new version."""
+
+    version: int = 1
+    brand_name: str
+    mission: str
+    vision: str
+    tone: list[str]
+    writing_style: list[str]
+    audience: str
+    visual_style: list[str]
+    preferred_colors: list[str]
+    content_philosophy: list[str]
+    niche: str
+    allowed_topics: list[str]
+    forbidden_topics: list[str] = Field(default_factory=list)
+    effective_from: datetime = Field(default_factory=datetime.utcnow)
+
+
+class Idea(BaseModel):
+    """
+    A single content idea produced by the Research Agent.
+
+    reasoning / confidence_score / knowledge_sources_used implement the "Workflow Memory"
+    (partial scope, adopted in v2.2) requirement: every idea selection records *why*,
+    not just *what*.
+    """
+
+    topic: str
+    angle: str
+    reasoning: str = Field(..., description="Why this idea was proposed / selected over alternatives")
+    confidence_score: float = Field(..., ge=0, le=1)
+    knowledge_sources_used: list[str] = Field(default_factory=list)
+    # TODO (Phase 1 full batching): rejected_alternatives, similarity_score (dedup),
+    # category tag (Evergreen/Seasonal/Event-specific/Experimental) once Idea Library exists.
+
+
+class GeneratedContent(BaseModel):
+    """Output of the Content Producer Agent for a single idea."""
+
+    idea_topic: str
+    caption: str
+    image_prompt: str
+    hashtags: list[str]
+    cta: str
+    platform_variants: dict[str, str] = Field(
+        default_factory=dict,
+        description="e.g. {'instagram': '...', 'linkedin': '...'}",
+    )
+    prompt_version: str = "v1"
+
+
+class RubricScores(BaseModel):
+    """The six-dimension Brand Guardian rubric from the spec."""
+
+    niche_fit: int = Field(..., ge=1, le=5)
+    brand_alignment: int = Field(..., ge=1, le=5)
+    originality: int = Field(..., ge=1, le=5)
+    value_to_audience: int = Field(..., ge=1, le=5)
+    grammar_clarity: int = Field(..., ge=1, le=5)
+    strategic_fit: int = Field(..., ge=1, le=5)
+
+    @property
+    def average(self) -> float:
+        values = [
+            self.niche_fit,
+            self.brand_alignment,
+            self.originality,
+            self.value_to_audience,
+            self.grammar_clarity,
+            self.strategic_fit,
+        ]
+        return sum(values) / len(values)
+
+    @property
+    def min_dimension(self) -> int:
+        return min(
+            self.niche_fit,
+            self.brand_alignment,
+            self.originality,
+            self.value_to_audience,
+            self.grammar_clarity,
+            self.strategic_fit,
+        )
+
+
+class BrandGuardianResult(BaseModel):
+    scores: RubricScores
+    passed: bool
+    reason: str
+    prompt_version: str = "v1"
+
+
+class AgentDecisionLog(BaseModel):
+    """
+    One row of what the spec calls `agent_decisions`. In this first slice it's printed
+    to console; wiring it to SQLite is a direct follow-on task, not a new design decision.
+    """
+
+    agent_name: str
+    input_summary: str
+    output_summary: str
+    passed: Optional[bool] = None
+    scores: Optional[RubricScores] = None
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
