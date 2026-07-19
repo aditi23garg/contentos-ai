@@ -10,11 +10,14 @@ touching any agent code (Provider Abstraction requirement).
 from __future__ import annotations
 
 import json
+import logging
 import re
 
 from openai import OpenAI
 
 from app.core import config
+
+logger = logging.getLogger(__name__)
 
 
 class LLMProvider:
@@ -29,29 +32,61 @@ class LLMProvider:
         else:
             raise ValueError(f"Unknown LLM_PROVIDER: {config.LLM_PROVIDER!r}")
 
-    def complete_json(self, system_prompt: str, user_prompt: str) -> dict:
+        # Set on every complete_json() call so callers (graph nodes) can optionally
+        # attach it to their AgentDecisionLog entry for full observability, without
+        # complete_json()'s return contract having to change to a tuple.
+        self.last_retry_count: int = 0
+
+    def complete_json(
+        self, system_prompt: str, user_prompt: str, max_retries: int = 2
+    ) -> dict:
         """
         Call the model and parse a JSON object from its response.
 
         We prompt for JSON-only output rather than relying on a provider-specific
         structured-output feature, since that keeps this working identically across
         Groq and Ollama models without per-provider branching.
+
+        The model occasionally truncates a long response mid-JSON (hits the token
+        limit before finishing the object) or emits an unescaped/extra character
+        around a string field. `max_tokens` gives long fields (e.g. Brand Guardian's
+        `reason`) enough room to finish -- that's the preventative fix. The retry
+        loop is the reactive fix for whatever still slips through: a fresh call
+        almost always returns valid JSON.
         """
-        response = self._client.chat.completions.create(
-            model=self._model,
-            temperature=0.7,
-            messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt
-                    + "\n\nRespond with ONLY a single valid JSON object. No prose, "
-                    "no markdown code fences, no preamble.",
-                },
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-        raw = response.choices[0].message.content.strip()
-        return self._extract_json(raw)
+        messages = [
+            {
+                "role": "system",
+                "content": system_prompt
+                + "\n\nRespond with ONLY a single valid JSON object. No prose, "
+                "no markdown code fences, no preamble.",
+            },
+            {"role": "user", "content": user_prompt},
+        ]
+
+        last_exc: Exception = RuntimeError("No attempts made")
+        for attempt in range(max_retries + 1):
+            response = self._client.chat.completions.create(
+                model=self._model,
+                temperature=0.7,
+                max_tokens=config.LLM_MAX_TOKENS,
+                messages=messages,
+            )
+            raw = response.choices[0].message.content.strip()
+            try:
+                parsed = self._extract_json(raw)
+                self.last_retry_count = attempt
+                return parsed
+            except ValueError as exc:
+                last_exc = exc
+                logger.warning(
+                    "JSON parse failed (attempt %d/%d): %s",
+                    attempt + 1,
+                    max_retries + 1,
+                    exc,
+                )
+        self.last_retry_count = max_retries
+        raise last_exc
 
     @staticmethod
     def _extract_json(raw: str) -> dict:
@@ -59,8 +94,21 @@ class LLMProvider:
         cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
         try:
             return json.loads(cleaned)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Model did not return valid JSON:\n{raw}") from exc
+        except json.JSONDecodeError:
+            pass
+
+        # Second attempt: extract the first {...} block via regex in case the
+        # model prefixed or suffixed extra text around the JSON object. Note this
+        # does NOT recover truly truncated JSON (a missing closing brace still
+        # fails here) -- that case is handled by the retry loop above, not this.
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+
+        raise ValueError(f"Model did not return valid JSON:\n{raw}")
 
 
 _provider: LLMProvider | None = None
@@ -72,3 +120,4 @@ def get_llm() -> LLMProvider:
     if _provider is None:
         _provider = LLMProvider()
     return _provider
+

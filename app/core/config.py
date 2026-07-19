@@ -30,6 +30,12 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 
+# Explicit response size cap. Without this, a long `reason` field (Brand Guardian) or
+# long `caption`/`platform_variants` (Content Producer) can hit the model's default
+# token limit mid-response and produce truncated, unparseable JSON. 1024 is generous
+# for this pipeline's field sizes; raise it if you extend any agent's output schema.
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1024"))
+
 # --- Brand Guardian rubric thresholds (Configuration section of the spec) ----------
 RUBRIC_PASS_AVERAGE = float(os.getenv("RUBRIC_PASS_AVERAGE", "4.0"))
 RUBRIC_MIN_DIMENSION = int(os.getenv("RUBRIC_MIN_DIMENSION", "3"))

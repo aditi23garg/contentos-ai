@@ -12,8 +12,12 @@ Usage:
 
 from __future__ import annotations
 
+import logging
+
 from app.core.config import load_brand_profile
 from app.graph.pipeline import build_pipeline
+
+logging.basicConfig(level=logging.WARNING, format="[%(levelname)s] %(name)s: %(message)s")
 
 
 def _print_decision_log(decisions: list) -> None:

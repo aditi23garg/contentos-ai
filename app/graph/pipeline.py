@@ -25,6 +25,7 @@ from app.core.schemas import (
     GeneratedContent,
     Idea,
 )
+from app.providers.llm import get_llm
 
 
 class PipelineState(TypedDict, total=False):
@@ -42,13 +43,21 @@ def _log(state: PipelineState, entry: AgentDecisionLog) -> list[AgentDecisionLog
     return [*state.get("decisions", []), entry]
 
 
+def _with_retry_note(summary: str) -> str:
+    """Append '(after N retries)' to a log summary if the last LLM call needed retries."""
+    retries = get_llm().last_retry_count
+    return f"{summary} (after {retries} retr{'y' if retries == 1 else 'ies'})" if retries else summary
+
+
 def research_node(state: PipelineState) -> dict:
     ideas = run_research(state["brand"], config.IDEAS_PER_RUN)
     best = max(ideas, key=lambda i: i.confidence_score)
     log_entry = AgentDecisionLog(
         agent_name="ResearchAgent",
         input_summary=f"niche={state['brand'].niche}, count={config.IDEAS_PER_RUN}",
-        output_summary=f"selected '{best.topic}' (confidence={best.confidence_score}) — {best.reasoning}",
+        output_summary=_with_retry_note(
+            f"selected '{best.topic}' (confidence={best.confidence_score}) — {best.reasoning}"
+        ),
     )
     return {"ideas": ideas, "idea": best, "decisions": _log(state, log_entry)}
 
@@ -58,7 +67,9 @@ def produce_node(state: PipelineState) -> dict:
     log_entry = AgentDecisionLog(
         agent_name="ContentProducerAgent",
         input_summary=f"idea='{state['idea'].topic}'",
-        output_summary=f"caption produced ({len(content.caption)} chars), prompt_version={content.prompt_version}",
+        output_summary=_with_retry_note(
+            f"caption produced ({len(content.caption)} chars), prompt_version={content.prompt_version}"
+        ),
     )
     return {"content": content, "decisions": _log(state, log_entry)}
 
@@ -68,7 +79,7 @@ def guardian_node(state: PipelineState) -> dict:
     log_entry = AgentDecisionLog(
         agent_name="BrandGuardianAgent",
         input_summary=f"idea='{state['idea'].topic}'",
-        output_summary=result.reason,
+        output_summary=_with_retry_note(result.reason),
         passed=result.passed,
         scores=result.scores,
     )
