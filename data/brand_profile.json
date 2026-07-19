@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "brand_name": "Life Out Loud",
+  "mission": "Help people become mentally stronger.",
+  "vision": "Create timeless motivational content that remains valuable for years.",
+  "tone": ["Warm", "Hopeful", "Reflective", "Friendly", "Authentic"],
+  "writing_style": ["Conversational", "Simple English", "Emotionally engaging", "Short paragraphs"],
+  "audience": "18-35 year olds seeking practical, grounded motivation",
+  "visual_style": ["Minimal", "Elegant", "Clean", "Warm lighting"],
+  "preferred_colors": ["Deep Green", "Beige", "Soft Gold"],
+  "content_philosophy": ["Evergreen over Viral", "Value over Volume", "Depth over Clickbait", "Authenticity over Algorithms"],
+  "niche": "Motivation",
+  "allowed_topics": [
+    "Self Improvement", "Mindset", "Discipline", "Confidence", "Productivity",
+    "Purpose", "Consistency", "Emotional Strength", "Healing", "Personal Growth",
+    "Focus", "Habits", "Success", "Resilience", "Courage", "Fear", "Failure",
+    "Leadership", "Life Lessons", "Growth Mindset"
+  ],
+  "forbidden_topics": [
+    "Politics", "Celebrity Gossip", "Cricket", "Fashion", "Gaming",
+    "Cryptocurrency", "Entertainment News", "Random Internet Trends"
+  ]
+}
