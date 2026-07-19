@@ -44,6 +44,14 @@ RUBRIC_MIN_DIMENSION = int(os.getenv("RUBRIC_MIN_DIMENSION", "3"))
 IDEAS_PER_RUN = int(os.getenv("IDEAS_PER_RUN", "3"))
 MAX_GUARDIAN_RETRIES = int(os.getenv("MAX_GUARDIAN_RETRIES", "1"))
 
+# --- Persistence (SQLite for records, ChromaDB for idea dedup embeddings) ----------
+DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "contentos.db")))
+CHROMA_PERSIST_DIR = Path(os.getenv("CHROMA_PERSIST_DIR", str(BASE_DIR / "data" / "chroma")))
+# How similar a new idea can be to a previously approved one before it's filtered out.
+# 0 = never filter, 1 = only filter exact duplicates. See vector_store.py for how this
+# similarity score is computed.
+DEDUP_SIMILARITY_THRESHOLD = float(os.getenv("DEDUP_SIMILARITY_THRESHOLD", "0.85"))
+
 
 def load_brand_profile(path: str | Path | None = None) -> BrandProfile:
     """Load the active (latest) versioned brand profile from data/brand_profile.json."""

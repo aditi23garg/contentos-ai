@@ -1,8 +1,9 @@
 """
 ContentOS AI — Phase 1, first runnable slice.
 
-Runs: Research Agent -> Content Producer Agent -> Brand Guardian Agent, for one idea,
-with a bounded regenerate loop, and prints the result plus the full decision log.
+Runs: Research Agent (dedup-checked against previously approved ideas) -> Content
+Producer Agent -> Brand Guardian Agent -> SQLite persistence, for one idea, with a
+bounded regenerate loop. Prints the result plus the full decision log.
 
 Usage:
     cp .env.example .env      # fill in GROQ_API_KEY (or set LLM_PROVIDER=ollama)
@@ -46,6 +47,7 @@ def main() -> None:
 
     print(f"\nTopic: {idea.topic}")
     print(f"Angle: {idea.angle}")
+    print(f"Dedup check: {final_state.get('dedup_note', 'n/a')}")
     print(f"\nCaption:\n{content.caption}")
     print(f"\nImage prompt:\n{content.image_prompt}")
     print(f"\nHashtags: {' '.join(content.hashtags)}")
