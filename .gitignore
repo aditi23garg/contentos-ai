@@ -1,0 +1,67 @@
+# ============================================================
+# ContentOS AI — .gitignore
+# ============================================================
+
+# --- Secrets & Environment ---
+.env
+*.pem
+*.key
+secrets/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+*.spec
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- IDEs ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# --- OS files ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Testing & coverage ---
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# --- LangGraph / LangChain local state ---
+langgraph.json
+.langgraph/
+
+# --- Vector DB local data ---
+chroma_db/
+*.db
+*.sqlite
+*.sqlite3
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+*.ipynb
+
+# --- Docker ---
+*.dockerignore
+
+# --- Spec / private docs (keep the spec out of the public repo) ---
+ContentOS_AI_Specification_v2.3.md
