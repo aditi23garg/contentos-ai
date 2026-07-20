@@ -40,8 +40,13 @@ LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1024"))
 RUBRIC_PASS_AVERAGE = float(os.getenv("RUBRIC_PASS_AVERAGE", "4.0"))
 RUBRIC_MIN_DIMENSION = int(os.getenv("RUBRIC_MIN_DIMENSION", "3"))
 
-# --- Batch sizing (kept small for this first runnable slice) -----------------------
-IDEAS_PER_RUN = int(os.getenv("IDEAS_PER_RUN", "3"))
+# --- Batching. Research generates IDEAS_PER_BATCH candidates in one call; after dedup
+# and in-batch near-duplicate filtering, the top BATCH_SIZE (by confidence) go through
+# full production + scoring. Kept modest by default to stay comfortably inside Groq's
+# free-tier request budget -- raise toward the spec's ~20/~10 once you've watched a
+# few batches run and are comfortable with the cost/time per cycle. -----------------
+IDEAS_PER_BATCH = int(os.getenv("IDEAS_PER_BATCH", "8"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "5"))
 MAX_GUARDIAN_RETRIES = int(os.getenv("MAX_GUARDIAN_RETRIES", "1"))
 
 # --- Persistence (SQLite for records, ChromaDB for idea dedup embeddings) ----------

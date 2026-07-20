@@ -50,5 +50,13 @@ Return a JSON object of this exact shape:
   ]
 }}"""
 
-    result = get_llm().complete_json(system_prompt, user_prompt)
+    result = get_llm().complete_json(
+        system_prompt,
+        user_prompt,
+        # Each idea has ~4 fields including a full-sentence `reasoning` -- roughly
+        # 150 tokens is a safe per-idea budget. A single-idea call still gets the
+        # global default floor; a 20-idea batch call gets real headroom instead of
+        # inheriting a cap sized for one idea.
+        max_tokens=max(1024, count * 150),
+    )
     return [Idea(**item) for item in result["ideas"]]

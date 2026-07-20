@@ -1,9 +1,11 @@
 """
-ContentOS AI — Phase 1, first runnable slice.
+ContentOS AI — Phase 1, Content Batching.
 
-Runs: Research Agent (dedup-checked against previously approved ideas) -> Content
-Producer Agent -> Brand Guardian Agent -> SQLite persistence, for one idea, with a
-bounded regenerate loop. Prints the result plus the full decision log.
+Runs one full weekly-style batch cycle: Research generates a pool of candidate ideas,
+dedup-filters them against previously approved history (ChromaDB) and against each
+other, takes the top BATCH_SIZE by confidence, and runs each through Content Producer
+-> Brand Guardian (with a bounded per-item retry) before persisting the whole batch to
+SQLite. Prints every item's result plus the full decision log.
 
 Usage:
     cp .env.example .env      # fill in GROQ_API_KEY (or set LLM_PROVIDER=ollama)
@@ -30,32 +32,35 @@ def _print_decision_log(decisions: list) -> None:
         print(line)
 
 
-def main() -> None:
-    brand = load_brand_profile()
-    pipeline = build_pipeline()
+def _print_batch_item(index: int, result: dict) -> None:
+    idea = result["idea"]
+    content = result["content"]
+    scores = result["guardian_result"].scores
 
-    print(f"Running ContentOS AI Phase 1 pipeline for brand: {brand.brand_name}\n")
-    final_state = pipeline.invoke({"brand": brand, "retries": 0})
-
-    print("=" * 60)
-    print(f"STATUS: {final_state['status'].upper()}")
-    print("=" * 60)
-
-    idea = final_state["idea"]
-    content = final_state["content"]
-    scores = final_state["guardian_result"].scores
-
-    print(f"\nTopic: {idea.topic}")
+    print("\n" + "-" * 60)
+    print(f"[{index}] {result['status'].upper()} — {idea.topic}")
+    print("-" * 60)
     print(f"Angle: {idea.angle}")
-    print(f"Dedup check: {final_state.get('dedup_note', 'n/a')}")
     print(f"\nCaption:\n{content.caption}")
     print(f"\nImage prompt:\n{content.image_prompt}")
     print(f"\nHashtags: {' '.join(content.hashtags)}")
     print(f"CTA: {content.cta}")
-    print("\nRubric scores:")
-    for dim, val in scores.model_dump().items():
-        print(f"  {dim}: {val}")
-    print(f"  average: {scores.average:.2f}")
+    print("\nRubric scores:", {k: v for k, v in scores.model_dump().items()}, f"| average: {scores.average:.2f}")
+
+
+def main() -> None:
+    brand = load_brand_profile()
+    pipeline = build_pipeline()
+
+    print(f"Running ContentOS AI batch pipeline for brand: {brand.brand_name}\n")
+    final_state = pipeline.invoke({"brand": brand})
+
+    print("=" * 60)
+    print(f"BATCH SUMMARY: {final_state['batch_summary']}")
+    print("=" * 60)
+
+    for i, result in enumerate(final_state["batch_results"], start=1):
+        _print_batch_item(i, result)
 
     _print_decision_log(final_state["decisions"])
 
