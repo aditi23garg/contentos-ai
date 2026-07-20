@@ -38,7 +38,11 @@ class LLMProvider:
         self.last_retry_count: int = 0
 
     def complete_json(
-        self, system_prompt: str, user_prompt: str, max_retries: int = 2
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_retries: int = 2,
+        max_tokens: int | None = None,
     ) -> dict:
         """
         Call the model and parse a JSON object from its response.
@@ -50,9 +54,14 @@ class LLMProvider:
         The model occasionally truncates a long response mid-JSON (hits the token
         limit before finishing the object) or emits an unescaped/extra character
         around a string field. `max_tokens` gives long fields (e.g. Brand Guardian's
-        `reason`) enough room to finish -- that's the preventative fix. The retry
-        loop is the reactive fix for whatever still slips through: a fresh call
-        almost always returns valid JSON.
+        `reason`, or a large batch of Research ideas) enough room to finish -- that's
+        the preventative fix. The retry loop is the reactive fix for whatever still
+        slips through: a fresh call almost always returns valid JSON.
+
+        `max_tokens` defaults to config.LLM_MAX_TOKENS but callers producing larger
+        structured output (e.g. a batch of ~20 ideas) should pass a higher value
+        explicitly -- the same truncation bug that hit a single `reason` field will
+        hit a large `ideas` array even more easily if left at the single-item default.
         """
         messages = [
             {
@@ -64,12 +73,14 @@ class LLMProvider:
             {"role": "user", "content": user_prompt},
         ]
 
+        token_limit = max_tokens if max_tokens is not None else config.LLM_MAX_TOKENS
+
         last_exc: Exception = RuntimeError("No attempts made")
         for attempt in range(max_retries + 1):
             response = self._client.chat.completions.create(
                 model=self._model,
                 temperature=0.7,
-                max_tokens=config.LLM_MAX_TOKENS,
+                max_tokens=token_limit,
                 messages=messages,
             )
             raw = response.choices[0].message.content.strip()
@@ -89,22 +100,109 @@ class LLMProvider:
         raise last_exc
 
     @staticmethod
+    def _repair_json_string(raw: str) -> str:
+        """
+        Apply two lightweight repairs to recover from the most common model-side
+        formatting mistakes:
+
+        1. Strip bare control characters (\\x00-\\x1f except \\t, \\n, \\r) that are
+           illegal inside JSON strings even when escaped.
+
+        2. Escape unescaped double-quotes that appear *inside* a JSON string
+           value — the canonical Guardian failure mode where the model writes:
+               "reason": "The concept of "growth mindset" is well-established."
+           which breaks strict JSON at the inner quote.
+
+        Repair 2 uses a character-by-character state machine because a regex
+        approach only matches *valid* string tokens and therefore can never see
+        the malformed outer boundary needed to locate the bare inner quotes.
+        The state machine tracks whether each `"` is a structural delimiter
+        (opening/closing a JSON string) or a bare emphasis quote inside a value,
+        and escapes the latter in-place.
+        """
+        # --- repair 1: illegal control characters ---
+        raw = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", raw)
+
+        # --- repair 2: state-machine quote escaper ---
+        out: list[str] = []
+        in_string = False     # True while inside a JSON string literal
+        escape_next = False   # True when previous char was a backslash
+
+        i = 0
+        while i < len(raw):
+            ch = raw[i]
+
+            if escape_next:
+                out.append(ch)
+                escape_next = False
+                i += 1
+                continue
+
+            if ch == "\\":
+                out.append(ch)
+                if in_string:
+                    escape_next = True
+                i += 1
+                continue
+
+            if ch == '"':
+                if not in_string:
+                    # Opening delimiter — start of a new JSON string.
+                    in_string = True
+                    out.append(ch)
+                else:
+                    # We are inside a string. Determine whether this `"` is the
+                    # closing delimiter or a bare embedded emphasis quote.
+                    # Heuristic: peek ahead (skip whitespace) — if the next
+                    # non-whitespace char is a JSON structural token (`:`, `,`,
+                    # `}`, `]`) or end-of-input, treat this as the closer.
+                    # Otherwise it is a bare inner quote and we escape it.
+                    rest = raw[i + 1:].lstrip(" \t\r\n")
+                    if not rest or rest[0] in ":,}]":
+                        in_string = False
+                        out.append(ch)
+                    else:
+                        out.append('\\"')  # escape the bare inner quote
+                i += 1
+                continue
+
+            out.append(ch)
+            i += 1
+
+        return "".join(out)
+
+    @staticmethod
     def _extract_json(raw: str) -> dict:
         # Strip markdown fences if the model added them despite instructions.
         cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+
+        # Attempt 1: parse as-is (the happy path — no repairs needed).
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError:
             pass
 
-        # Second attempt: extract the first {...} block via regex in case the
-        # model prefixed or suffixed extra text around the JSON object. Note this
-        # does NOT recover truly truncated JSON (a missing closing brace still
-        # fails here) -- that case is handled by the retry loop above, not this.
+        # Attempt 2: apply lightweight text repairs for the two most common
+        # model-side mistakes (illegal control chars + unescaped inner quotes)
+        # before trying to parse again.  This recovers the Guardian's "reason"
+        # embedded-quote failure without spending a full retry LLM call.
+        try:
+            return json.loads(LLMProvider._repair_json_string(cleaned))
+        except json.JSONDecodeError:
+            pass
+
+        # Attempt 3: extract the first {...} block via regex in case the model
+        # prefixed or suffixed extra text, then apply repairs + parse.
+        # Note: truly truncated JSON (missing closing brace) still fails here
+        # and falls through to the retry loop in complete_json() — intentional.
         match = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+            try:
+                return json.loads(LLMProvider._repair_json_string(match.group()))
             except json.JSONDecodeError:
                 pass
 
