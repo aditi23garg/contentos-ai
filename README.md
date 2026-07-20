@@ -1,57 +1,174 @@
-# ContentOS AI — Phase 1, first runnable slice
+﻿# ContentOS AI — Phase 1, Content Batching Pipeline
 
-This is the smallest slice of the ContentOS AI v2.3 spec that runs end-to-end:
-
-```
-Research Agent -> Content Producer Agent -> Brand Guardian Agent
-```
-
-with a bounded regenerate loop when the Guardian rejects the content. It intentionally
-does **not** yet include: content batching, the dashboard, dedup/vector-DB, scheduling,
-publishing, or analytics. Those are additive once this slice is proven with real daily
-use — building them now would be planning ahead of data, which the spec itself argues
-against.
-
-## What's here
+An AI-powered content factory for the **"Life Out Loud"** motivational brand.
+Three specialised agents research ideas, write publish-ready posts, and quality-score
+them against a six-dimension brand rubric — all wired together as a LangGraph
+state machine that runs one full weekly-style batch end-to-end.
 
 ```
-contentos_ai/
-├── main.py                          # entry point — runs the pipeline once, prints result
+Research Agent -> dedup filter -> Content Producer Agent -> Brand Guardian Agent -> SQLite + ChromaDB
+```
+
+---
+
+## Architecture
+
+```
+contentos_ai_batching/
+├── main.py                          # Entry point — runs one full batch cycle
+├── probe_guardian.py                # Discrimination probe: tests Guardian scoring range
+├── test_json_repair.py              # Smoke tests for the hardened JSON parser
+├── inspect_history.py               # CLI tool to inspect persisted ideas/posts/decisions
 ├── requirements.txt
 ├── .env.example
 ├── data/
-│   └── brand_profile.json           # the "Life Out Loud" brand from the spec
+│   ├── brand_profile.json           # "Life Out Loud" brand — versioned, never mutated in place
+│   ├── contentos.db                 # SQLite — ideas, posts, agent_decisions (auto-created)
+│   └── chroma/                      # ChromaDB vector index for idea dedup (auto-created)
 └── app/
     ├── core/
-    │   ├── schemas.py                # Pydantic models: BrandProfile, Idea, GeneratedContent,
-    │   │                              #   RubricScores, BrandGuardianResult, AgentDecisionLog
-    │   └── config.py                 # env-driven config, brand profile loader
+    │   ├── schemas.py               # Pydantic models: BrandProfile, Idea, GeneratedContent,
+    │   │                            #   RubricScores, BrandGuardianResult, AgentDecisionLog
+    │   └── config.py                # Env-driven config — all thresholds & provider settings
     ├── providers/
-    │   └── llm.py                    # Groq/Ollama provider abstraction (OpenAI-SDK-compatible)
+    │   └── llm.py                   # Groq / Ollama provider abstraction (OpenAI-SDK-compatible)
+    │                                # Includes hardened _extract_json with state-machine repair
     ├── agents/
-    │   ├── research_agent.py
-    │   ├── content_producer_agent.py
-    │   └── brand_guardian_agent.py
-    └── graph/
-        └── pipeline.py               # the LangGraph state machine wiring it together
+    │   ├── research_agent.py        # Generates niche-locked ideas from LLM knowledge
+    │   ├── content_producer_agent.py# Writes caption + image prompt + hashtags + CTA in one call
+    │   └── brand_guardian_agent.py  # Scores content on 6-dimension rubric, pass/fail decision
+    ├── graph/
+    │   └── pipeline.py              # LangGraph state machine: research -> produce -> guardian ->
+    │                                # retry loop -> persist batch
+    ├── repositories/
+    │   ├── db.py                    # SQLAlchemy models: IdeaRecord, PostRecord, AgentDecisionRecord
+    │   ├── repository.py            # Repository functions — only place translating Pydantic <-> ORM
+    │   └── vector_store.py          # ChromaDB wrapper for idea similarity / dedup
+    └── services/
+        └── batching.py              # Dedup filter, near-dup filter, top-N ranking, surplus backlog
 ```
 
-This follows the Repository Pattern / Service Layer / Provider Abstraction standards
-from the spec's Engineering Standards section — each agent is a plain function taking
-a Pydantic model and returning one, the LLM provider is swappable via `.env` alone, and
-nothing in `app/agents` knows or cares whether it's talking to Groq or Ollama.
+---
+
+## What's Implemented
+
+### 1. Three-Agent Pipeline (LangGraph)
+
+The pipeline runs as a linear state machine with conditional edges:
+
+```
+research -> produce -> guardian ---+
+               ^                    +-- passed   -> record_result -> advance -> produce (next item)
+           bump_retry <-- retry ----+                             -> finalize -> persist_batch -> END
+                                    +-- rejected -> record_result
+```
+
+- **Research Agent** — prompts the LLM for `IDEAS_PER_BATCH` (default: 8) niche-locked
+  ideas with topic, angle, reasoning, confidence score, and knowledge sources. Only
+  evergreen, credibility-weighted sources (books, peer-reviewed research, psychology,
+  behavioral science, philosophy).
+
+- **Content Producer Agent** — takes a single idea and produces a complete post in one
+  structured LLM call: caption, image prompt, hashtags, CTA, plus Instagram/LinkedIn
+  platform variants.
+
+- **Brand Guardian Agent** — scores each post on six dimensions (each 1-5):
+  `niche_fit`, `brand_alignment`, `originality`, `value_to_audience`,
+  `grammar_clarity`, `strategic_fit`. Pass requires average >= 4.0 and every dimension >= 3.
+  If it fails, content is regenerated once (configurable via `MAX_GUARDIAN_RETRIES`)
+  before being recorded as rejected.
+
+### 2. Content Batching with Dedup
+
+Before any content is produced, the Research Agent's candidate pool goes through two
+filtering layers:
+
+1. **History dedup** (ChromaDB) — embeds each candidate idea and checks cosine
+   similarity against every previously approved idea. Candidates above
+   `DEDUP_SIMILARITY_THRESHOLD` (default: 0.85) are dropped. This ensures a rejected
+   attempt on a topic does not permanently block it — only *approved* history counts.
+
+2. **In-batch near-duplicate filter** (difflib SequenceMatcher) — drops near-identical
+   ideas proposed within the same Research call. Threshold: 0.9 similarity ratio.
+
+After filtering, ideas are ranked by confidence score and the top `BATCH_SIZE` (default: 5)
+go through production. The rest are saved to the Idea Library as `status='backlog'`.
+
+### 3. Idea Library — Backlog Status
+
+Ideas that survive both dedup filters but do not make the `BATCH_SIZE` cutoff are **no
+longer silently discarded**. They are persisted to SQLite with `status='backlog'`,
+preserving good ideas that did not make this week's cut for future use.
+
+Status lifecycle in the `ideas` table:
+
+| Status   | Meaning |
+|----------|---------|
+| `approved` | Passed Guardian, full post produced, indexed in ChromaDB |
+| `rejected` | Failed Guardian after all retries |
+| `backlog` | Survived dedup but below the batch cutoff — saved for next cycle |
+
+### 4. Hardened JSON Parser (`_extract_json`)
+
+The LLM occasionally wraps phrases in unescaped double-quotes inside a JSON string
+(e.g. `"reason": "The concept of "growth mindset" is..."`), causing `json.loads`
+to fail. Previously this triggered a full retry LLM call on every Guardian invocation.
+
+The parser now has four layered attempts before falling through to a retry:
+
+| Attempt | What it does |
+|---------|-------------|
+| 1 | `json.loads(raw)` — happy path |
+| 2 | `json.loads(repair(raw))` — state-machine repair: strips illegal control chars, escapes bare inner quotes |
+| 3 | `json.loads(extract_block(raw))` — pulls first `{...}` block in case of preamble text |
+| 4 | `json.loads(repair(extract_block(raw)))` — block extraction + repair combined |
+
+The **state-machine repair** (`_repair_json_string`) walks each character, tracks
+whether it is inside a JSON string, and uses a lookahead heuristic — next non-whitespace
+char is `:`, `,`, `}`, `]`, or EOF means closing delimiter; otherwise it is a bare
+inner quote and gets escaped. A regex-based approach was tried first but cannot work
+because it can only match valid string tokens, never the malformed boundary.
+
+**Result:** zero `(after 1 retry)` annotations observed in pipeline runs since the fix.
+
+### 5. Guardian Discrimination Validated
+
+A deliberate probe (`probe_guardian.py`) confirmed the Guardian scores are genuinely
+discriminating, not stuck on a safe default:
+
+| Test Case | Avg | niche_fit | originality | grammar_clarity |
+|-----------|-----|-----------|-------------|-----------------|
+| Strong on-brand content | 4.67 | 5 | 4 | 5 |
+| Generic / cliche filler | 3.83 | 5 | **2** | 5 |
+| Wrong niche (crypto) | 2.00 | **1** | 2 | 5 |
+| Poor grammar + clickbait | 1.17 | 2 | **1** | **1** |
+
+**Score spread: 3.50** — well above the 1.5 threshold for meaningful discrimination.
+The consistent 4.67 average in real runs reflects genuine output quality from Groq's
+`llama-3.3-70b-versatile`, not a stuck rubric.
+
+---
 
 ## Setup
 
 ```bash
-cd contentos_ai
-python -m venv venv && source venv/bin/activate   # optional but recommended
+# 1. Clone and enter the project
+cd contentos_ai_batching
+
+# 2. Create a virtual environment (recommended)
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+
+# 3. Install dependencies
 pip install -r requirements.txt
+
+# 4. Configure environment
 cp .env.example .env
+# Edit .env and add GROQ_API_KEY (free at https://console.groq.com)
+# Or set LLM_PROVIDER=ollama to run fully offline
 ```
 
-Edit `.env` and add your Groq API key (free, no credit card — https://console.groq.com),
-or set `LLM_PROVIDER=ollama` if you'd rather run fully local/offline.
+---
 
 ## Run
 
@@ -59,32 +176,96 @@ or set `LLM_PROVIDER=ollama` if you'd rather run fully local/offline.
 python main.py
 ```
 
-This runs one full cycle: the Research Agent proposes a few niche-locked ideas, the
-highest-confidence one goes to the Content Producer, and the Brand Guardian scores it
-against the six-dimension rubric. If it fails, it's regenerated once before the run
-ends either "approved" or "rejected". The full decision log (what was tried, what
-scored what, why) prints at the end — this is the console version of the
-`agent_decisions` table the fuller spec calls for.
+One full batch cycle:
+1. Research Agent generates 8 candidate ideas
+2. Dedup filters against ChromaDB history; near-dup filter removes in-batch siblings
+3. Top 5 by confidence go through Content Producer -> Brand Guardian
+4. All results (approved / rejected) persist to SQLite; surplus ideas saved as backlog
+5. Approved ideas indexed in ChromaDB for future dedup
+6. Full decision log printed to console
 
-## What's verified
+### Inspect history
 
-This scaffold was tested with a mocked LLM provider (no API calls) to confirm:
-- the LangGraph wiring runs Research → Produce → Guardian → Finalize correctly
-- the reject → regenerate → re-guardian retry loop works and respects
-  `MAX_GUARDIAN_RETRIES`
-- every step's Pydantic schema round-trips correctly
+```bash
+python inspect_history.py
+```
 
-It has **not** been run against a live Groq/Ollama endpoint from this environment —
-you'll want to run it locally with a real API key first, and sanity-check the actual
-model output before trusting the rubric scores.
+Queries SQLite to show all persisted ideas, posts, and agent decisions from past runs.
 
-## Natural next steps, in order
+### Run Guardian discrimination probe
 
-1. Wire this same pipeline to SQLite so `agent_decisions`, `Post`, and `Idea` persist
-   instead of only printing to console.
-2. Swap the single-idea flow for real Content Batching (~20 ideas → best ~10 → batch
-   produce/score), per the spec.
-3. Add the ChromaDB dedup + knowledge-retrieval step to the Research Agent.
-4. Build the Streamlit dashboard for review/approve/edit, replacing the console print.
-5. Only then: Scheduler, Publisher (Phase 2), and the weekly Performance Reviewer
-   (Phase 3).
+```bash
+python probe_guardian.py
+```
+
+Sends 4 hand-crafted test cases (strong, generic, wrong-niche, bad grammar) to the
+live Guardian and prints a discrimination analysis with a spread verdict.
+Re-run this any time the rubric prompt is changed.
+
+### Run JSON parser smoke tests
+
+```bash
+python test_json_repair.py
+```
+
+8 unit tests covering: clean JSON, embedded quotes, multiple quoted phrases, control
+characters, markdown fences, combined fence+quotes, preamble text, truncated JSON.
+
+---
+
+## Configuration (`.env`)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLM_PROVIDER` | `groq` | `groq` or `ollama` |
+| `GROQ_API_KEY` | — | From https://console.groq.com (free tier) |
+| `GROQ_MODEL` | `llama-3.3-70b-versatile` | Any Groq-hosted model |
+| `OLLAMA_BASE_URL` | `http://localhost:11434/v1` | Local Ollama endpoint |
+| `OLLAMA_MODEL` | `llama3.1` | Any locally pulled Ollama model |
+| `LLM_MAX_TOKENS` | `1024` | Response cap; raise for larger Research batches |
+| `IDEAS_PER_BATCH` | `8` | Candidates Research generates per cycle |
+| `BATCH_SIZE` | `5` | Max ideas sent through production per cycle |
+| `MAX_GUARDIAN_RETRIES` | `1` | Retries per item when Guardian fails |
+| `DEDUP_SIMILARITY_THRESHOLD` | `0.85` | Cosine similarity cutoff vs. approved history |
+| `DB_PATH` | `data/contentos.db` | SQLite file path |
+| `CHROMA_PERSIST_DIR` | `data/chroma` | ChromaDB persistence directory |
+| `RUBRIC_PASS_AVERAGE` | `4.0` | Minimum average score to pass Guardian |
+| `RUBRIC_MIN_DIMENSION` | `3` | Minimum score on any single dimension to pass |
+
+---
+
+## Design Decisions
+
+- **Single LLM call per agent** — the Content Producer consolidates writer, image-prompt,
+  SEO, and CTA into one structured-output call. Four separate calls for the same output
+  is wasteful.
+
+- **Provider abstraction** — Groq and Ollama are both OpenAI-SDK-compatible. Switching
+  providers is a config change, not a code change. Adding OpenAI/Claude/Gemini means
+  adding one branch to `llm.py`, not touching any agent.
+
+- **Repository Pattern** — `app/repositories/repository.py` is the only place that
+  translates between Pydantic schemas (what agents use) and SQLAlchemy records (what
+  the DB stores). Nothing outside it imports the `*Record` classes.
+
+- **Linear graph, not agent mesh** — the pipeline is a LangGraph state machine with
+  conditional edges, not a free-form multi-agent mesh. Per the v2.3 spec philosophy:
+  the simplest wiring that does the job.
+
+- **Dedup only blocks on approved history** — a rejected attempt on a topic does not
+  permanently block it. The topic can come back, get better content produced, and pass
+  the Guardian on a subsequent run. This is intentional by design.
+
+---
+
+## What's Next
+
+1. **Idea Library top-up** — on each Research call, check the backlog first and
+   top up with fresh candidates only to fill `IDEAS_PER_BATCH`. Backlog is currently
+   saved but not yet read back in.
+2. **Content Diversity Check** — feed real post history into `strategic_fit` scoring
+   so the Guardian can detect calendar-level repetition, not just within-batch.
+3. **Streamlit dashboard** — visual review/approve/edit interface replacing console print.
+4. **Scheduler + Publisher** — Phase 2: auto-schedule approved posts and publish via
+   platform APIs.
+5. **Performance Reviewer** — Phase 3: weekly analytics feedback loop.
