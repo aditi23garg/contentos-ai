@@ -23,45 +23,50 @@ def idea_text(idea: Idea) -> str:
 
 def dedup_filter(
     ideas: list[Idea], vector_store: VectorStore, threshold: float
-) -> tuple[list[Idea], list[str]]:
+) -> tuple[list[Idea], list[Idea], list[str]]:
     """
-    Split a pool of ideas into (survivors, filtered_notes) by checking each against
-    previously approved ideas in the vector store. Order is preserved among survivors.
+    Split a pool of ideas into (survivors, filtered_ideas, filtered_notes) by
+    checking each against previously approved ideas in the vector store. Order is
+    preserved among survivors. filtered_ideas (not just notes) is returned so the
+    caller can tell which *specific* ideas were dropped -- needed to archive
+    backlog-sourced ideas that are now stale, see build_batch_queue.
     """
     survivors: list[Idea] = []
+    filtered_ideas: list[Idea] = []
     filtered_notes: list[str] = []
 
     for idea in ideas:
         matches = vector_store.find_similar(idea_text(idea), threshold)
         if matches:
+            filtered_ideas.append(idea)
             filtered_notes.append(f"'{idea.topic}' (similarity={matches[0][1]:.2f} to '{matches[0][0]}')")
         else:
             survivors.append(idea)
 
-    return survivors, filtered_notes
+    return survivors, filtered_ideas, filtered_notes
 
 
-def near_duplicate_filter(ideas: list[Idea], threshold: float = 0.9) -> tuple[list[Idea], int]:
+def near_duplicate_filter(ideas: list[Idea], threshold: float = 0.9) -> tuple[list[Idea], list[Idea]]:
     """
     Drop ideas that are near-duplicates of an earlier idea in the same list (the
     first occurrence is kept). This catches the case where one Research call
     proposes two near-identical ideas in the same batch -- a different failure mode
     than dedup_filter above, which checks against persisted history, not siblings
-    in the same candidate pool.
+    in the same candidate pool. Returns (kept, filtered_ideas).
     """
     kept: list[Idea] = []
     kept_texts: list[str] = []
-    filtered_count = 0
+    filtered_ideas: list[Idea] = []
 
     for idea in ideas:
         text = idea_text(idea)
         if any(difflib.SequenceMatcher(None, text.lower(), t.lower()).ratio() >= threshold for t in kept_texts):
-            filtered_count += 1
+            filtered_ideas.append(idea)
             continue
         kept.append(idea)
         kept_texts.append(text)
 
-    return kept, filtered_count
+    return kept, filtered_ideas
 
 
 def select_top(ideas: list[Idea], count: int) -> list[Idea]:
@@ -75,40 +80,56 @@ def build_batch_queue(
     dedup_threshold: float,
     batch_size: int,
     near_dup_threshold: float = 0.9,
-) -> tuple[list[Idea], list[Idea], str]:
+) -> tuple[list[Idea], list[Idea], list[Idea], str]:
     """
     The full Research -> Dedup -> Rank -> in-batch-dedup -> take-top pipeline in one
     call, so graph nodes don't need to know the individual filtering steps. Falls
     back to the single best original candidate (with a note explaining why) if
     everything gets filtered out, rather than returning an empty queue.
 
-    Returns a three-tuple: (queue, surplus, note).
+    `candidates` may be a mix of freshly-researched Ideas and ideas read back from
+    the backlog (Idea.source_backlog_id set) -- see repository.get_backlog_ideas.
+
+    Returns a four-tuple: (queue, surplus, stale, note).
     - queue:   top `batch_size` ideas to run through production this cycle.
     - surplus: ideas that survived all filters but didn't make the batch cutoff,
-               ordered by confidence (highest first). Saved to the Idea Library
-               as status='backlog' so they aren't silently discarded.
+               ordered by confidence (highest first). Freshly-researched ones get
+               saved to the Idea Library as status='backlog'; backlog-sourced ones
+               that are still surplus need no DB change, they're already 'backlog'.
+    - stale:   backlog-sourced ideas that got filtered out this cycle by either
+               dedup check (a similar idea is now in approved history) or the
+               near-duplicate check (duplicates another candidate in this pool).
+               These should be archived rather than left as 'backlog' forever --
+               otherwise they'd get pulled and re-filtered every cycle indefinitely.
     - note:    human-readable summary of filtering decisions for the decision log.
     """
-    survivors, history_notes = dedup_filter(candidates, vector_store, dedup_threshold)
+    survivors, history_filtered, history_notes = dedup_filter(candidates, vector_store, dedup_threshold)
     ranked = select_top(survivors, len(survivors))
-    deduped, batch_filtered_count = near_duplicate_filter(ranked, near_dup_threshold)
+    deduped, batch_filtered = near_duplicate_filter(ranked, near_dup_threshold)
     queue = deduped[:batch_size]
     surplus = deduped[batch_size:]  # survivors that didn't make this week's cut
+
+    stale = [
+        idea for idea in (*history_filtered, *batch_filtered)
+        if idea.source_backlog_id is not None
+    ]
+    batch_filtered_count = len(batch_filtered)
 
     if not queue:
         queue = select_top(candidates, 1)
         surplus = []  # nothing clean to backlog when we had to fall back to emergency pick
+        stale = [idea for idea in stale if idea not in queue]
         note = (
             f"{'; '.join(history_notes) if history_notes else 'no history duplicates'} — "
             "all candidates were filtered; proceeding with the single best original idea anyway"
         )
     else:
         backlog_note = f", {len(surplus)} held for backlog" if surplus else ""
+        stale_note = f", {len(stale)} stale backlog item(s) archived" if stale else ""
         note = (
             f"generated {len(candidates)} candidates, {len(history_notes)} filtered as repeats of "
             f"approved history, {batch_filtered_count} filtered as in-batch near-duplicates, "
-            f"queued {len(queue)} for production{backlog_note}"
+            f"queued {len(queue)} for production{backlog_note}{stale_note}"
         )
 
-    return queue, surplus, note
-
+    return queue, surplus, stale, note

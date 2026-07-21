@@ -26,6 +26,46 @@ def save_idea(session: Session, idea: Idea, status: str, dedup_note: str = "") -
     return record
 
 
+def get_backlog_ideas(session: Session, limit: int) -> list[Idea]:
+    """
+    Idea Library top-up: read back ideas saved as status='backlog' by a previous
+    cycle (see build_batch_queue's `surplus`) as real Idea objects the pipeline can
+    re-run through dedup/rank/production, instead of leaving them to rot unused.
+
+    Ranked by confidence first, then oldest-first as a tiebreak so a backlog idea
+    that's tied on confidence doesn't sit forever behind newer arrivals.
+    """
+    rows = (
+        session.query(IdeaRecord)
+        .filter(IdeaRecord.status == "backlog")
+        .order_by(IdeaRecord.confidence_score.desc(), IdeaRecord.created_at.asc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        Idea(
+            topic=r.topic,
+            angle=r.angle,
+            reasoning=r.reasoning,
+            confidence_score=r.confidence_score,
+            knowledge_sources_used=from_json(r.knowledge_sources_used) or [],
+            source_backlog_id=r.id,
+        )
+        for r in rows
+    ]
+
+
+def update_idea_status(session: Session, idea_id: int, status: str) -> None:
+    """
+    Update an existing ideas row in place -- used for backlog-sourced ideas so a
+    second cycle updates the original row (to approved/rejected/archived) instead
+    of save_idea() inserting a duplicate row for the same idea.
+    """
+    record = session.query(IdeaRecord).filter(IdeaRecord.id == idea_id).one_or_none()
+    if record is not None:
+        record.status = status
+
+
 def save_post(
     session: Session, idea_id: int, content: GeneratedContent, guardian_result: BrandGuardianResult
 ) -> PostRecord:

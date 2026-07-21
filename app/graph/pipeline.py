@@ -1,7 +1,8 @@
 """
 The Phase-1 pipeline as a LangGraph, now doing real Content Batching per the spec:
 
-    Research (IDEAS_PER_BATCH candidates)
+    Research: pull backlog first (Idea Library top-up), then top up with only as
+              many fresh candidates as needed to reach IDEAS_PER_BATCH
         -> Dedup (vs. history) + near-duplicate filter (within this batch)
         -> take top BATCH_SIZE by confidence
         -> for each: Produce -> Guardian (bounded per-item retry) -> record result
@@ -32,7 +33,13 @@ from app.core.schemas import (
 )
 from app.providers.llm import get_llm
 from app.repositories.db import get_session
-from app.repositories.repository import save_decision, save_idea, save_post
+from app.repositories.repository import (
+    get_backlog_ideas,
+    save_decision,
+    save_idea,
+    save_post,
+    update_idea_status,
+)
 from app.repositories.vector_store import get_vector_store
 from app.services.batching import build_batch_queue, idea_text
 
@@ -48,6 +55,7 @@ class PipelineState(TypedDict, total=False):
     brand: BrandProfile
     queue: list[Idea]
     surplus: list[Idea]          # ideas that survived dedup but didn't make this batch's cutoff
+    stale: list[Idea]            # backlog-sourced ideas filtered out this cycle -- archive, don't re-pull
     queue_index: int
     item_retries: int
     content: GeneratedContent
@@ -67,22 +75,36 @@ def _with_retry_note(summary: str) -> str:
 
 
 def research_node(state: PipelineState) -> dict:
-    candidates = run_research(state["brand"], config.IDEAS_PER_BATCH)
-    queue, surplus, note = build_batch_queue(
+    session = get_session()
+    try:
+        backlog_ideas = get_backlog_ideas(session, config.IDEAS_PER_BATCH)
+    finally:
+        session.close()
+
+    # Idea Library top-up: only ask the Research Agent for what the backlog didn't
+    # already cover -- this is the whole point of persisting surplus ideas instead
+    # of discarding them, and it directly saves LLM calls on the free-tier budget.
+    deficit = max(0, config.IDEAS_PER_BATCH - len(backlog_ideas))
+    fresh_ideas = run_research(state["brand"], deficit) if deficit > 0 else []
+    candidates = [*backlog_ideas, *fresh_ideas]
+
+    queue, surplus, stale, note = build_batch_queue(
         candidates,
         vector_store=get_vector_store(),
         dedup_threshold=config.DEDUP_SIMILARITY_THRESHOLD,
         batch_size=config.BATCH_SIZE,
     )
 
+    backlog_summary = f", {len(backlog_ideas)} pulled from backlog" if backlog_ideas else ""
     log_entry = AgentDecisionLog(
         agent_name="ResearchAgent",
-        input_summary=f"niche={state['brand'].niche}, requested={config.IDEAS_PER_BATCH}",
+        input_summary=f"niche={state['brand'].niche}, requested={deficit} fresh{backlog_summary}",
         output_summary=_with_retry_note(note),
     )
     return {
         "queue": queue,
         "surplus": surplus,
+        "stale": stale,
         "queue_index": 0,
         "item_retries": 0,
         "batch_results": [],
@@ -141,18 +163,40 @@ def advance_node(state: PipelineState) -> dict:
 
 def persist_batch_node(state: PipelineState) -> dict:
     """Writes every item in the batch to SQLite and indexes approved ideas in ChromaDB.
-    Also saves surplus (backlogged) ideas that survived dedup but didn't make this
-    batch's cutoff, so they are preserved in the Idea Library rather than discarded.
+
+    Three kinds of ideas get handled differently here, all part of closing the loop
+    on the Idea Library backlog:
+    - Freshly-researched ideas (no source_backlog_id) get a new row, as before.
+    - Backlog-sourced ideas that were processed this cycle get their *existing* row
+      updated in place (approved/rejected) rather than a duplicate inserted.
+    - Backlog-sourced ideas filtered out this cycle as stale (build_batch_queue's
+      `stale` list) get archived so they stop being re-pulled and re-filtered
+      every cycle indefinitely.
+    Freshly-researched surplus ideas are still saved as new 'backlog' rows;
+    backlog-sourced surplus ideas need no change, they're already 'backlog'.
     """
     session = get_session()
     try:
         for result in state["batch_results"]:
-            idea_record = save_idea(session, result["idea"], status=result["status"])
-            save_post(session, idea_record.id, result["content"], result["guardian_result"])
+            idea = result["idea"]
+            if idea.source_backlog_id is not None:
+                update_idea_status(session, idea.source_backlog_id, result["status"])
+                idea_id = idea.source_backlog_id
+            else:
+                idea_record = save_idea(session, idea, status=result["status"])
+                idea_id = idea_record.id
+            save_post(session, idea_id, result["content"], result["guardian_result"])
             if result["status"] == "approved":
-                get_vector_store().add_idea(str(idea_record.id), idea_text(result["idea"]))
+                get_vector_store().add_idea(str(idea_id), idea_text(idea))
+
         for surplus_idea in state.get("surplus", []):
-            save_idea(session, surplus_idea, status="backlog")
+            if surplus_idea.source_backlog_id is None:
+                save_idea(session, surplus_idea, status="backlog")
+            # else: backlog-sourced and still surplus -- row is already 'backlog', no-op.
+
+        for stale_idea in state.get("stale", []):
+            update_idea_status(session, stale_idea.source_backlog_id, "archived")
+
         for entry in state["decisions"]:
             save_decision(session, entry)
         session.commit()
@@ -161,9 +205,16 @@ def persist_batch_node(state: PipelineState) -> dict:
 
     approved = sum(1 for r in state["batch_results"] if r["status"] == "approved")
     rejected = len(state["batch_results"]) - approved
-    backlogged = len(state.get("surplus", []))
+    backlogged = sum(1 for i in state.get("surplus", []) if i.source_backlog_id is None)
+    archived = len(state.get("stale", []))
     backlog_note = f", {backlogged} backlogged" if backlogged else ""
-    return {"batch_summary": f"{len(state['batch_results'])} processed, {approved} approved, {rejected} rejected{backlog_note}"}
+    archive_note = f", {archived} stale backlog archived" if archived else ""
+    return {
+        "batch_summary": (
+            f"{len(state['batch_results'])} processed, {approved} approved, "
+            f"{rejected} rejected{backlog_note}{archive_note}"
+        )
+    }
 
 
 def route_after_guardian(state: PipelineState) -> str:
