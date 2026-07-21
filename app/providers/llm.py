@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 
 class LLMProvider:
+    # Matches the start of a plausible next JSON key, e.g. `"scores": ` --
+    # used only to disambiguate a quote-then-comma inside _repair_json_string.
+    _LOOKS_LIKE_NEXT_KEY = re.compile(r'^"[^"\\]*"\s*:')
+
     def __init__(self) -> None:
         if config.LLM_PROVIDER == "groq":
             self._client = OpenAI(api_key=config.GROQ_API_KEY, base_url=config.GROQ_BASE_URL)
@@ -119,6 +123,14 @@ class LLMProvider:
         The state machine tracks whether each `"` is a structural delimiter
         (opening/closing a JSON string) or a bare emphasis quote inside a value,
         and escapes the latter in-place.
+
+        The `,` lookahead case is genuinely ambiguous on its own: a comma right
+        after a quote could be a real field separator (`"reason": "text", "x": 1`)
+        or just prose punctuation that happens to follow a bare inner quote
+        (`"The word "discipline", used loosely, matters."`). We disambiguate by
+        peeking *past* the comma: if what follows looks like a new JSON key
+        (`"key":`) or end-of-input, it's a real closing delimiter; otherwise
+        it's still inside the value and the quote gets escaped.
         """
         # --- repair 1: illegal control characters ---
         raw = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", raw)
@@ -158,9 +170,20 @@ class LLMProvider:
                     # `}`, `]`) or end-of-input, treat this as the closer.
                     # Otherwise it is a bare inner quote and we escape it.
                     rest = raw[i + 1:].lstrip(" \t\r\n")
-                    if not rest or rest[0] in ":,}]":
+                    if not rest or rest[0] in ":}]":
                         in_string = False
                         out.append(ch)
+                    elif rest[0] == ",":
+                        # Ambiguous on its own -- peek past the comma. A real
+                        # closing comma is followed by a new key ("key": ...);
+                        # otherwise this is prose punctuation after a bare
+                        # inner quote and we're still inside the value.
+                        after_comma = rest[1:].lstrip(" \t\r\n")
+                        if not after_comma or LLMProvider._LOOKS_LIKE_NEXT_KEY.match(after_comma):
+                            in_string = False
+                            out.append(ch)
+                        else:
+                            out.append('\\"')  # escape the bare inner quote
                     else:
                         out.append('\\"')  # escape the bare inner quote
                 i += 1

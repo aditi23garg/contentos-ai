@@ -11,8 +11,11 @@ from app.providers.llm import LLMProvider
 PASS = "PASS"
 FAIL = "FAIL"
 errors = []
+total = 0
 
 def check(name: str, condition: bool, detail: str = "") -> None:
+    global total
+    total += 1
     if condition:
         print(f"  {PASS}  {name}")
     else:
@@ -66,9 +69,25 @@ try:
 except ValueError:
     check("T8 truncated JSON raises ValueError (retry loop handles it)", True)
 
+# T9: embedded quote immediately followed by a comma used as prose punctuation,
+# not a field separator -- this used to be misread as the string's closing quote
+# and fail to parse. Fixed by peeking past the comma for a "key": pattern.
+comma_prose = '{"reason": "The word "discipline", used loosely, matters."}'
+r = LLMProvider._extract_json(comma_prose)
+check("T9 inner quote followed by prose comma repaired", r["reason"] == 'The word "discipline", used loosely, matters.')
+
+# T10: make sure a *real* field-separating comma right after an inner quote
+# still closes the string correctly (the case T9's fix must not break)
+real_separator = '{"reason": "Discusses "grit" well", "scores": {"niche_fit": 5}}'
+r = LLMProvider._extract_json(real_separator)
+check(
+    "T10 genuine comma field-separator after inner quote still works",
+    r["reason"] == 'Discusses "grit" well' and r["scores"]["niche_fit"] == 5,
+)
+
 print()
 if errors:
     print(f"  {len(errors)} test(s) FAILED: {', '.join(errors)}")
     sys.exit(1)
 else:
-    print(f"  All 8 tests passed.\n")
+    print(f"  All {total} tests passed.\n")
