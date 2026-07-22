@@ -79,6 +79,11 @@ def research_node(state: PipelineState) -> dict:
     session = get_session()
     try:
         backlog_ideas = get_backlog_ideas(session, config.IDEAS_PER_BATCH)
+        # Same Content Diversity Check query the Guardian uses for strategic_fit,
+        # fetched here too so Research steers away from recently covered themes up
+        # front instead of relying solely on the post-hoc dedup filter to catch
+        # collisions -- see the module docstring in research_agent.py.
+        recent_topics = get_recent_approved_topics(session, limit=20)
     finally:
         session.close()
 
@@ -86,7 +91,7 @@ def research_node(state: PipelineState) -> dict:
     # already cover -- this is the whole point of persisting surplus ideas instead
     # of discarding them, and it directly saves LLM calls on the free-tier budget.
     deficit = max(0, config.IDEAS_PER_BATCH - len(backlog_ideas))
-    fresh_ideas = run_research(state["brand"], deficit) if deficit > 0 else []
+    fresh_ideas = run_research(state["brand"], deficit, recent_topics=recent_topics) if deficit > 0 else []
     candidates = [*backlog_ideas, *fresh_ideas]
 
     queue, surplus, stale, note = build_batch_queue(
@@ -97,9 +102,10 @@ def research_node(state: PipelineState) -> dict:
     )
 
     backlog_summary = f", {len(backlog_ideas)} pulled from backlog" if backlog_ideas else ""
+    history_note = f", diversity_context={len(recent_topics)} recent posts" if recent_topics else ""
     log_entry = AgentDecisionLog(
         agent_name="ResearchAgent",
-        input_summary=f"niche={state['brand'].niche}, requested={deficit} fresh{backlog_summary}",
+        input_summary=f"niche={state['brand'].niche}, requested={deficit} fresh{backlog_summary}{history_note}",
         output_summary=_with_retry_note(note),
     )
     return {

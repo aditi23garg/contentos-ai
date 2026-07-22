@@ -41,6 +41,15 @@ class LLMProvider:
         # complete_json()'s return contract having to change to a tuple.
         self.last_retry_count: int = 0
 
+        # Groq (and most recent Ollama builds) support OpenAI-style JSON mode --
+        # constrained decoding that makes the model syntactically incapable of
+        # emitting invalid/incomplete JSON, rather than just being *asked* to via
+        # the system prompt. This is a strictly stronger fix than prompting harder
+        # or raising max_tokens for the "model stops mid-object" failure mode.
+        # Not every Ollama model supports it, so we probe once and remember the
+        # result rather than assuming -- see _request() below.
+        self._json_mode_supported: bool | None = None  # None = not probed yet
+
     def complete_json(
         self,
         system_prompt: str,
@@ -51,28 +60,34 @@ class LLMProvider:
         """
         Call the model and parse a JSON object from its response.
 
-        We prompt for JSON-only output rather than relying on a provider-specific
-        structured-output feature, since that keeps this working identically across
-        Groq and Ollama models without per-provider branching.
+        Primary defense: constrained JSON mode via _request() when the provider
+        supports it (Groq does) -- this makes the model syntactically incapable of
+        emitting invalid or incomplete JSON, rather than just being *asked* to via
+        the system prompt. Some models still stop generation mid-object even when
+        the JSON so far is well within max_tokens (observed on Groq's
+        llama-3.3-70b-versatile) -- that failure mode is what JSON mode targets;
+        raising max_tokens alone does not fix it, since the model isn't running out
+        of room, it's just stopping early.
 
-        The model occasionally truncates a long response mid-JSON (hits the token
-        limit before finishing the object) or emits an unescaped/extra character
-        around a string field. `max_tokens` gives long fields (e.g. Brand Guardian's
-        `reason`, or a large batch of Research ideas) enough room to finish -- that's
-        the preventative fix. The retry loop is the reactive fix for whatever still
-        slips through: a fresh call almost always returns valid JSON.
+        Two more layers below that: _extract_json()'s state-machine repair fixes
+        the model still emitting an unescaped inner quote (a formatting mistake
+        JSON mode can't always prevent either), and the retry loop is the last
+        resort for whatever slips through both -- a fresh call almost always
+        returns valid JSON.
 
-        `max_tokens` defaults to config.LLM_MAX_TOKENS but callers producing larger
-        structured output (e.g. a batch of ~20 ideas) should pass a higher value
-        explicitly -- the same truncation bug that hit a single `reason` field will
-        hit a large `ideas` array even more easily if left at the single-item default.
+        `max_tokens` still matters for genuinely large output (e.g. a batch of
+        ~20 Research ideas) and defaults to config.LLM_MAX_TOKENS; callers
+        producing more content than a single Guardian `reason` field should pass
+        a higher value explicitly.
         """
         messages = [
             {
                 "role": "system",
                 "content": system_prompt
                 + "\n\nRespond with ONLY a single valid JSON object. No prose, "
-                "no markdown code fences, no preamble.",
+                "no markdown code fences, no preamble. Output compact JSON on a "
+                "single line -- no indentation, no pretty-printing, no extra "
+                "whitespace between tokens.",
             },
             {"role": "user", "content": user_prompt},
         ]
@@ -81,12 +96,7 @@ class LLMProvider:
 
         last_exc: Exception = RuntimeError("No attempts made")
         for attempt in range(max_retries + 1):
-            response = self._client.chat.completions.create(
-                model=self._model,
-                temperature=0.7,
-                max_tokens=token_limit,
-                messages=messages,
-            )
+            response = self._request(messages, token_limit)
             raw = response.choices[0].message.content.strip()
             try:
                 parsed = self._extract_json(raw)
@@ -102,6 +112,37 @@ class LLMProvider:
                 )
         self.last_retry_count = max_retries
         raise last_exc
+
+    def _request(self, messages: list[dict], token_limit: int):
+        """
+        Issue the chat completion, preferring constrained JSON mode when the
+        provider supports it (see _json_mode_supported comment in __init__).
+
+        Probes capability at most once per LLMProvider instance: on the first
+        call we try with response_format set; if the provider rejects the
+        parameter outright (some Ollama models do), we remember that and never
+        try it again for this instance, instead of failing or re-probing every call.
+        """
+        kwargs = dict(model=self._model, temperature=0.7, max_tokens=token_limit, messages=messages)
+
+        if self._json_mode_supported is not False:
+            try:
+                response = self._client.chat.completions.create(
+                    response_format={"type": "json_object"}, **kwargs
+                )
+                self._json_mode_supported = True
+                return response
+            except Exception as exc:  # noqa: BLE001 -- provider capability probe, not a parse error
+                if self._json_mode_supported is None:
+                    logger.info(
+                        "Provider does not support response_format=json_object "
+                        "(%s); falling back to prompt-only JSON enforcement for "
+                        "the rest of this run.",
+                        exc,
+                    )
+                self._json_mode_supported = False
+
+        return self._client.chat.completions.create(**kwargs)
 
     @staticmethod
     def _repair_json_string(raw: str) -> str:

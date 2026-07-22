@@ -3,9 +3,20 @@ Research Agent.
 
 Scope in this first slice: generates niche-locked ideas from the model's own knowledge,
 weighted toward the trusted-source categories in the spec's Research Agent Rules. It does
-NOT yet call a live search API or the ChromaDB dedup/knowledge-retrieval layer -- both are
-direct follow-on additions (Content Batching / Knowledge Refresh Scheduler) once this
-slice is proven, not new design decisions.
+NOT yet call a live search API or the ChromaDB knowledge-retrieval layer -- that's a
+direct follow-on addition (Knowledge Refresh Scheduler) once this slice is proven, not
+a new design decision.
+
+Recent-history awareness: run_research can be given the same recent-approved-topics
+list already computed for the Brand Guardian's strategic_fit score (see
+get_recent_approved_topics / Content Diversity Check). Without it, every candidate was
+proposed blind and dedup_filter (app/services/batching.py) was the only thing catching
+collisions with prior approved history -- fine early on, but as approved-idea history
+grows in a narrow niche, an increasing share of a fresh batch gets filtered out after
+the fact, sometimes all of it (build_batch_queue's single-item fallback). Feeding the
+same history in up front lets Research actively steer away from recently covered
+themes, so dedup becomes a safety net again instead of the primary filter. Zero-cost:
+reuses an existing query, no new agent or LLM call.
 """
 
 from __future__ import annotations
@@ -20,7 +31,32 @@ SOURCE_CREDIBILITY_NOTE = (
 )
 
 
-def run_research(brand: BrandProfile, count: int) -> list[Idea]:
+def run_research(brand: BrandProfile, count: int, recent_topics: list[str] | None = None) -> list[Idea]:
+    """
+    Args:
+        brand: The active brand profile.
+        count: Number of fresh candidate ideas to request.
+        recent_topics: Last N approved post topics+angles (newest-first), from
+            get_recent_approved_topics(). Pass an empty list (or omit) when no
+            history is available (first run, tests, etc.). When provided, injected
+            into the system prompt so Research steers away from recently covered
+            themes instead of relying solely on the post-hoc dedup filter.
+    """
+    recent_topics = recent_topics or []
+
+    history_section = ""
+    if recent_topics:
+        numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(recent_topics))
+        history_section = f"""
+
+## Recent Post History (last {len(recent_topics)} approved post{'s' if len(recent_topics) != 1 else ''} -- avoid repeating these)
+
+{numbered}
+
+Do not propose an idea that repeats the same theme and angle as one of the entries
+above. A related theme is fine ONLY if you give it a meaningfully different angle
+from anything already covered -- otherwise pick a different theme within the niche."""
+
     system_prompt = f"""You are the Research Agent for a niche content brand called
 "{brand.brand_name}". Niche: {brand.niche}.
 
@@ -33,7 +69,7 @@ historical stories, productivity, audience pain points, and trusted niche discus
 Never propose anything based on random internet trends. {SOURCE_CREDIBILITY_NOTE}
 
 For each idea, you must state WHY you're proposing it (reasoning), not just what it is --
-this becomes part of the system's permanent decision log."""
+this becomes part of the system's permanent decision log.{history_section}"""
 
     user_prompt = f"""Propose {count} distinct content ideas for this brand.
 

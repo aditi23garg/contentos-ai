@@ -157,7 +157,7 @@ config_module.DEDUP_SIMILARITY_THRESHOLD = 0.85
 captured_deficit = {}
 
 
-def fake_run_research(brand, count):
+def fake_run_research(brand, count, recent_topics=None):
     captured_deficit["requested"] = count
     return [
         Idea(topic=f"Fresh {i}", angle="a", reasoning="r", confidence_score=0.4)
