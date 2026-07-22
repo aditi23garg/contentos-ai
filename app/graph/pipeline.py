@@ -35,6 +35,7 @@ from app.providers.llm import get_llm
 from app.repositories.db import get_session
 from app.repositories.repository import (
     get_backlog_ideas,
+    get_recent_approved_topics,
     save_decision,
     save_idea,
     save_post,
@@ -127,10 +128,21 @@ def produce_node(state: PipelineState) -> dict:
 
 def guardian_node(state: PipelineState) -> dict:
     idea = state["queue"][state["queue_index"]]
-    result = evaluate(state["brand"], state["content"])
+
+    # Content Diversity Check: pull the last 20 approved topics from SQLite so the
+    # Guardian can score strategic_fit against real calendar history, not just a
+    # qualitative guess. This is a cheap read-only query done once per item.
+    session = get_session()
+    try:
+        recent_topics = get_recent_approved_topics(session, limit=20)
+    finally:
+        session.close()
+
+    result = evaluate(state["brand"], state["content"], recent_topics=recent_topics)
+    history_note = f", diversity_context={len(recent_topics)} recent posts" if recent_topics else ""
     log_entry = AgentDecisionLog(
         agent_name="BrandGuardianAgent",
-        input_summary=f"idea='{idea.topic}' ({state['queue_index'] + 1}/{len(state['queue'])})",
+        input_summary=f"idea='{idea.topic}' ({state['queue_index'] + 1}/{len(state['queue'])}){history_note}",
         output_summary=_with_retry_note(result.reason),
         passed=result.passed,
         scores=result.scores,

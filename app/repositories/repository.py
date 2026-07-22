@@ -114,3 +114,23 @@ def recent_approved_idea_texts(session: Session, limit: int = 100) -> list[str]:
         .all()
     )
     return [f"{r.topic}: {r.angle}" for r in rows]
+
+
+def get_recent_approved_topics(session: Session, limit: int = 20) -> list[str]:
+    """
+    Content Diversity Check: returns the last `limit` approved post topics+angles
+    as compact strings (newest-first) to be passed to the Brand Guardian so it can
+    score `strategic_fit` against real calendar history, not just a qualitative guess.
+
+    Deliberately capped at 20 (roughly 400-500 tokens when injected into the prompt)
+    to stay comfortably within LLM_MAX_TOKENS. Raise the cap if you increase
+    LLM_MAX_TOKENS and want a deeper history window.
+    """
+    rows = (
+        session.query(IdeaRecord)
+        .filter(IdeaRecord.status == "approved")
+        .order_by(IdeaRecord.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [f"{r.topic}: {r.angle}" for r in rows]

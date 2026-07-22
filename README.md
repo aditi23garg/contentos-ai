@@ -1,4 +1,4 @@
-﻿# ContentOS AI — Phase 1, Content Batching Pipeline
+# ContentOS AI — Phase 1, Content Batching Pipeline
 
 An AI-powered content factory for the **"Life Out Loud"** motivational brand.
 Three specialised agents research ideas, write publish-ready posts, and quality-score
@@ -18,6 +18,7 @@ contentos_ai_batching/
 ├── main.py                          # Entry point — runs one full batch cycle
 ├── probe_guardian.py                # Discrimination probe: tests Guardian scoring range
 ├── test_json_repair.py              # Smoke tests for the hardened JSON parser
+├── test_backlog_topup.py            # Smoke tests for backlog read-back / archive-on-stale
 ├── inspect_history.py               # CLI tool to inspect persisted ideas/posts/decisions
 ├── requirements.txt
 ├── .env.example
@@ -37,6 +38,7 @@ contentos_ai_batching/
     │   ├── research_agent.py        # Generates niche-locked ideas from LLM knowledge
     │   ├── content_producer_agent.py# Writes caption + image prompt + hashtags + CTA in one call
     │   └── brand_guardian_agent.py  # Scores content on 6-dimension rubric, pass/fail decision
+    │                                #   v2: injects real post history for concrete strategic_fit scoring
     ├── graph/
     │   └── pipeline.py              # LangGraph state machine: research -> produce -> guardian ->
     │                                # retry loop -> persist batch
@@ -94,19 +96,31 @@ filtering layers:
 After filtering, ideas are ranked by confidence score and the top `BATCH_SIZE` (default: 5)
 go through production. The rest are saved to the Idea Library as `status='backlog'`.
 
-### 3. Idea Library — Backlog Status
+### 3. Idea Library — Backlog Top-Up
 
 Ideas that survive both dedup filters but do not make the `BATCH_SIZE` cutoff are **no
-longer silently discarded**. They are persisted to SQLite with `status='backlog'`,
-preserving good ideas that did not make this week's cut for future use.
+longer silently discarded**. They are persisted to SQLite with `status='backlog'`.
+
+The next cycle now reads that backlog back in *before* asking the Research Agent for
+anything: `research_node` pulls up to `IDEAS_PER_BATCH` backlog ideas (ranked by
+confidence, oldest first as tiebreak) and only asks Research for the deficit —
+`IDEAS_PER_BATCH - len(backlog_pulled)`. A cycle with a full backlog can run with
+**zero** fresh Research calls, which matters on a free-tier LLM budget.
+
+Backlog-sourced ideas that get produced this cycle update their *existing* `ideas`
+row in place (approved/rejected) instead of inserting a duplicate. If a backlog idea
+gets filtered out this cycle — because a similar idea is now in approved history, or
+because a fresh candidate duplicates it — it's archived (`status='archived'`) rather
+than left as `backlog` to be re-pulled and re-filtered every cycle indefinitely.
 
 Status lifecycle in the `ideas` table:
 
-| Status   | Meaning |
-|----------|---------|
+| Status     | Meaning |
+|------------|---------|
 | `approved` | Passed Guardian, full post produced, indexed in ChromaDB |
 | `rejected` | Failed Guardian after all retries |
-| `backlog` | Survived dedup but below the batch cutoff — saved for next cycle |
+| `backlog`  | Survived dedup but below the batch cutoff — read back in next cycle |
+| `archived` | Backlog idea that went stale (dedup/near-dup filtered it on a later cycle) |
 
 ### 4. Hardened JSON Parser (`_extract_json`)
 
@@ -131,7 +145,30 @@ because it can only match valid string tokens, never the malformed boundary.
 
 **Result:** zero `(after 1 retry)` annotations observed in pipeline runs since the fix.
 
-### 5. Guardian Discrimination Validated
+### 5. Content Diversity Check
+
+Before v2, the Brand Guardian scored `strategic_fit` purely qualitatively —
+it had no concrete knowledge of what had already been published and consistently
+awarded 4 almost every run.
+
+The Guardian now receives the **last 20 approved post topics+angles** (from
+`get_recent_approved_topics()` in the repository) as a numbered history section
+appended to its system prompt. Explicit scoring instructions are included:
+
+| strategic_fit | When to award it |
+|---------------|------------------|
+| 1-2 | Closely matches a topic already in recent history |
+| 3 | Thematically adjacent but meaningfully different angle |
+| 4-5 | Fresh theme not covered in recent approved posts |
+
+This is a **zero-cost addition**: one read-only SQL query per item, no new
+tables, no new agents, no schema changes. Guardian prompt bumped to `v2`.
+
+The decision log entry for each Guardian call now includes a
+`diversity_context=N recent posts` annotation confirming how many history
+entries were injected.
+
+### 6. Guardian Discrimination Validated
 
 A deliberate probe (`probe_guardian.py`) confirmed the Guardian scores are genuinely
 discriminating, not stuck on a safe default:
@@ -260,12 +297,7 @@ characters, markdown fences, combined fence+quotes, preamble text, truncated JSO
 
 ## What's Next
 
-1. **Idea Library top-up** — on each Research call, check the backlog first and
-   top up with fresh candidates only to fill `IDEAS_PER_BATCH`. Backlog is currently
-   saved but not yet read back in.
-2. **Content Diversity Check** — feed real post history into `strategic_fit` scoring
-   so the Guardian can detect calendar-level repetition, not just within-batch.
-3. **Streamlit dashboard** — visual review/approve/edit interface replacing console print.
-4. **Scheduler + Publisher** — Phase 2: auto-schedule approved posts and publish via
+1. **Streamlit dashboard** — visual review/approve/edit interface replacing console print.
+2. **Scheduler + Publisher** — Phase 2: auto-schedule approved posts and publish via
    platform APIs.
-5. **Performance Reviewer** — Phase 3: weekly analytics feedback loop.
+3. **Performance Reviewer** — Phase 3: weekly analytics feedback loop.
