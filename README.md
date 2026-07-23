@@ -80,21 +80,41 @@ research -> produce -> guardian ---+
   If it fails, content is regenerated once (configurable via `MAX_GUARDIAN_RETRIES`)
   before being recorded as rejected.
 
-### 2. Content Batching with Dedup
+### 2. Content Batching with Dedup — Two-Tier Threshold
 
 Before any content is produced, the Research Agent's candidate pool goes through two
 filtering layers:
 
-1. **History dedup** (ChromaDB) — embeds each candidate idea and checks cosine
-   similarity against every previously approved idea. Candidates above
-   `DEDUP_SIMILARITY_THRESHOLD` (default: 0.85) are dropped. This ensures a rejected
-   attempt on a topic does not permanently block it — only *approved* history counts.
+1. **History dedup** (ChromaDB) — embeds each candidate idea and checks embedding
+   similarity against every previously approved idea, using a **two-tier threshold**:
+
+   | Pair type | Threshold | Config var |
+   |-----------|-----------|------------|
+   | Different topic labels | `0.85` | `DEDUP_SIMILARITY_THRESHOLD` |
+   | Same topic label (case-insensitive match) | `0.62` | `DEDUP_SAME_TOPIC_THRESHOLD` |
+
+   The two-tier design comes from running `calibrate_dedup_threshold.py` against 54
+   real approved ideas (1 431 pairs): same-topic duplicate pairs scored 0.58–0.75
+   similarity — the general 0.85 threshold caught **0%** of them. An exact topic-label
+   match is a free, much stronger signal than embedding similarity alone for short
+   motivational copy; gating a lower threshold on that match costs nothing extra (no
+   new embedding calls) and cannot introduce false positives on genuinely distinct
+   cross-topic pairs. Approved ideas are now indexed in ChromaDB **with their topic
+   label as metadata** so the two-tier check can apply on future runs.
+
+   This ensures a rejected attempt on a topic does not permanently block it — only
+   *approved* history counts.
 
 2. **In-batch near-duplicate filter** (difflib SequenceMatcher) — drops near-identical
    ideas proposed within the same Research call. Threshold: 0.9 similarity ratio.
 
 After filtering, ideas are ranked by confidence score and the top `BATCH_SIZE` (default: 5)
 go through production. The rest are saved to the Idea Library as `status='backlog'`.
+
+The per-idea result of the dedup check is now written to **`IdeaRecord.dedup_note`**
+in SQLite (this column existed in the schema but was never populated before). You can
+see it in the `inspect_history.py` output.
+
 
 ### 3. Idea Library — Backlog Top-Up
 
@@ -248,6 +268,29 @@ python test_json_repair.py
 8 unit tests covering: clean JSON, embedded quotes, multiple quoted phrases, control
 characters, markdown fences, combined fence+quotes, preamble text, truncated JSON.
 
+### Run two-tier dedup smoke test
+
+```bash
+python test_two_tier_dedup.py
+```
+
+5 unit tests verifying: same-topic candidate caught by lower `same_topic_threshold`;
+different-topic candidate at the same similarity **not** caught; backward-compatible
+call (no topic arg) works; genuinely distinct content never caught; topic metadata
+actually persisted to ChromaDB.
+
+### Calibrate dedup threshold against real data
+
+```bash
+python calibrate_dedup_threshold.py        # full report (top 15 closest pairs)
+python calibrate_dedup_threshold.py --top 20
+```
+
+Computes the full pairwise similarity matrix across every approved idea in ChromaDB,
+splits pairs into same-topic vs. different-topic groups, and prints distribution
+statistics. Use this whenever you want to re-evaluate `DEDUP_SIMILARITY_THRESHOLD`
+or `DEDUP_SAME_TOPIC_THRESHOLD` against accumulated real data.
+
 ---
 
 ## Configuration (`.env`)
@@ -263,7 +306,8 @@ characters, markdown fences, combined fence+quotes, preamble text, truncated JSO
 | `IDEAS_PER_BATCH` | `8` | Candidates Research generates per cycle |
 | `BATCH_SIZE` | `5` | Max ideas sent through production per cycle |
 | `MAX_GUARDIAN_RETRIES` | `1` | Retries per item when Guardian fails |
-| `DEDUP_SIMILARITY_THRESHOLD` | `0.85` | Cosine similarity cutoff vs. approved history |
+| `DEDUP_SIMILARITY_THRESHOLD` | `0.85` | Similarity cutoff vs. approved history (different topic label) |
+| `DEDUP_SAME_TOPIC_THRESHOLD` | `0.62` | Lower cutoff applied only when candidate topic = stored idea's topic |
 | `DB_PATH` | `data/contentos.db` | SQLite file path |
 | `CHROMA_PERSIST_DIR` | `data/chroma` | ChromaDB persistence directory |
 | `RUBRIC_PASS_AVERAGE` | `4.0` | Minimum average score to pass Guardian |

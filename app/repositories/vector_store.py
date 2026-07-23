@@ -35,31 +35,56 @@ class VectorStore:
             kwargs["embedding_function"] = embedding_function
         self._collection = self._client.get_or_create_collection(**kwargs)
 
-    def find_similar(self, text: str, threshold: float) -> list[tuple[str, float]]:
-        """Return [(matched_text, similarity)] for stored ideas above `threshold`, best first."""
+    def find_similar(
+        self,
+        text: str,
+        threshold: float,
+        topic: str | None = None,
+        same_topic_threshold: float | None = None,
+    ) -> list[tuple[str, float]]:
+        """
+        Return [(matched_text, similarity)] for stored ideas above threshold, best first.
+
+        Two-tier threshold: if `topic` and `same_topic_threshold` are given, a stored
+        idea whose metadata topic matches `topic` (case-insensitive) is compared
+        against `same_topic_threshold` instead of `threshold`. See
+        config.DEDUP_SAME_TOPIC_THRESHOLD for why -- exact topic-label match turned
+        out to be a much stronger, free signal than embedding similarity alone for
+        this content, per calibrate_dedup_threshold.py's findings against real data.
+        Callers that don't pass `topic` get the old single-threshold behavior.
+        """
         count = self._collection.count()
         if count == 0:
             return []
 
-        results = self._collection.query(query_texts=[text], n_results=min(5, count))
+        results = self._collection.query(
+            query_texts=[text], n_results=min(5, count), include=["documents", "distances", "metadatas"]
+        )
         documents = results.get("documents", [[]])[0]
         distances = results.get("distances", [[]])[0]
+        metadatas = results.get("metadatas", [[]])[0] or [{}] * len(documents)
 
         matches = []
-        for doc, distance in zip(documents, distances):
+        for doc, distance, meta in zip(documents, distances, metadatas):
             # Chroma's default space is squared L2 on normalized embeddings, which for
             # normalized vectors maps roughly to a 0 (identical) - 2 (opposite) range.
             # This similarity conversion is intentionally approximate -- good enough to
             # rank and threshold on, not meant to be a precise cosine similarity value.
             similarity = max(0.0, 1 - (distance / 2))
-            if similarity >= threshold:
+
+            effective_threshold = threshold
+            stored_topic = (meta or {}).get("topic", "")
+            if topic and same_topic_threshold is not None and stored_topic.strip().lower() == topic.strip().lower():
+                effective_threshold = same_topic_threshold
+
+            if similarity >= effective_threshold:
                 matches.append((doc, similarity))
 
         matches.sort(key=lambda m: m[1], reverse=True)
         return matches
 
-    def add_idea(self, idea_id: str, text: str) -> None:
-        self._collection.add(ids=[idea_id], documents=[text])
+    def add_idea(self, idea_id: str, text: str, topic: str | None = None) -> None:
+        self._collection.add(ids=[idea_id], documents=[text], metadatas=[{"topic": topic or ""}])
 
 
 _store: VectorStore | None = None

@@ -22,7 +22,10 @@ def idea_text(idea: Idea) -> str:
 
 
 def dedup_filter(
-    ideas: list[Idea], vector_store: VectorStore, threshold: float
+    ideas: list[Idea],
+    vector_store: VectorStore,
+    threshold: float,
+    same_topic_threshold: float | None = None,
 ) -> tuple[list[Idea], list[Idea], list[str]]:
     """
     Split a pool of ideas into (survivors, filtered_ideas, filtered_notes) by
@@ -30,17 +33,32 @@ def dedup_filter(
     preserved among survivors. filtered_ideas (not just notes) is returned so the
     caller can tell which *specific* ideas were dropped -- needed to archive
     backlog-sourced ideas that are now stale, see build_batch_queue.
+
+    `same_topic_threshold`, when given, is passed through to find_similar for its
+    two-tier check (see config.DEDUP_SAME_TOPIC_THRESHOLD) -- a much lower bar
+    applied only when a stored idea's topic label exactly matches this idea's.
+
+    Also sets idea.dedup_note on every idea checked (mutates in place) so the
+    per-idea result of this check travels with the Idea all the way to
+    persist_batch_node -> IdeaRecord.dedup_note, not just into the batch-level
+    agent_decisions note. Previously that column existed but nothing ever wrote to
+    it for individual ideas.
     """
     survivors: list[Idea] = []
     filtered_ideas: list[Idea] = []
     filtered_notes: list[str] = []
 
     for idea in ideas:
-        matches = vector_store.find_similar(idea_text(idea), threshold)
+        matches = vector_store.find_similar(
+            idea_text(idea), threshold, topic=idea.topic, same_topic_threshold=same_topic_threshold
+        )
         if matches:
+            note = f"'{idea.topic}' (similarity={matches[0][1]:.2f} to '{matches[0][0]}')"
+            idea.dedup_note = f"filtered as repeat: {note}"
             filtered_ideas.append(idea)
-            filtered_notes.append(f"'{idea.topic}' (similarity={matches[0][1]:.2f} to '{matches[0][0]}')")
+            filtered_notes.append(note)
         else:
+            idea.dedup_note = f"no match >= {threshold} threshold found in approved history"
             survivors.append(idea)
 
     return survivors, filtered_ideas, filtered_notes
@@ -80,6 +98,7 @@ def build_batch_queue(
     dedup_threshold: float,
     batch_size: int,
     near_dup_threshold: float = 0.9,
+    same_topic_threshold: float | None = None,
 ) -> tuple[list[Idea], list[Idea], list[Idea], str]:
     """
     The full Research -> Dedup -> Rank -> in-batch-dedup -> take-top pipeline in one
@@ -89,6 +108,9 @@ def build_batch_queue(
 
     `candidates` may be a mix of freshly-researched Ideas and ideas read back from
     the backlog (Idea.source_backlog_id set) -- see repository.get_backlog_ideas.
+
+    `same_topic_threshold`, when given, is passed through to dedup_filter for its
+    two-tier check (see config.DEDUP_SAME_TOPIC_THRESHOLD).
 
     Returns a four-tuple: (queue, surplus, stale, note).
     - queue:   top `batch_size` ideas to run through production this cycle.
@@ -103,7 +125,9 @@ def build_batch_queue(
                otherwise they'd get pulled and re-filtered every cycle indefinitely.
     - note:    human-readable summary of filtering decisions for the decision log.
     """
-    survivors, history_filtered, history_notes = dedup_filter(candidates, vector_store, dedup_threshold)
+    survivors, history_filtered, history_notes = dedup_filter(
+        candidates, vector_store, dedup_threshold, same_topic_threshold=same_topic_threshold
+    )
     ranked = select_top(survivors, len(survivors))
     deduped, batch_filtered = near_duplicate_filter(ranked, near_dup_threshold)
     queue = deduped[:batch_size]
@@ -123,6 +147,11 @@ def build_batch_queue(
             f"{'; '.join(history_notes) if history_notes else 'no history duplicates'} — "
             "all candidates were filtered; proceeding with the single best original idea anyway"
         )
+        # Overwrite whatever dedup_filter set on this specific idea -- it may say
+        # "no match" (near-dup-filtered, not history-filtered) or "filtered as
+        # repeat" (history match, overridden anyway). Either way, make the override
+        # itself explicit on the persisted row rather than leaving an ambiguous note.
+        queue[0].dedup_note = f"EMERGENCY OVERRIDE (dedup exhausted the batch): {queue[0].dedup_note}"
     else:
         backlog_note = f", {len(surplus)} held for backlog" if surplus else ""
         stale_note = f", {len(stale)} stale backlog item(s) archived" if stale else ""

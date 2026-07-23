@@ -62,6 +62,16 @@ class Idea(BaseModel):
             "instead of inserting a duplicate, and archive it if it goes stale."
         ),
     )
+    dedup_note: str = Field(
+        default="",
+        description=(
+            "What the dedup check found/did for this idea, set by "
+            "app.services.batching.dedup_filter. Carried on the Idea itself (rather "
+            "than only in the batch-level agent_decisions note) so persist_batch_node "
+            "can write it to IdeaRecord.dedup_note per-item -- that column existed in "
+            "the schema but was never actually populated before this field was added."
+        ),
+    )
     # TODO (Phase 1 full batching): rejected_alternatives, similarity_score (dedup),
     # category tag (Evergreen/Seasonal/Event-specific/Experimental) once Idea Library exists.
 

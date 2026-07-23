@@ -52,10 +52,22 @@ MAX_GUARDIAN_RETRIES = int(os.getenv("MAX_GUARDIAN_RETRIES", "1"))
 # --- Persistence (SQLite for records, ChromaDB for idea dedup embeddings) ----------
 DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "contentos.db")))
 CHROMA_PERSIST_DIR = Path(os.getenv("CHROMA_PERSIST_DIR", str(BASE_DIR / "data" / "chroma")))
-# How similar a new idea can be to a previously approved one before it's filtered out.
-# 0 = never filter, 1 = only filter exact duplicates. See vector_store.py for how this
-# similarity score is computed.
+# How similar a new idea can be to a previously approved one before it's filtered out,
+# when the two ideas have DIFFERENT topic labels. 0 = never filter, 1 = only filter
+# exact duplicates. See vector_store.py for how this similarity score is computed.
 DEDUP_SIMILARITY_THRESHOLD = float(os.getenv("DEDUP_SIMILARITY_THRESHOLD", "0.85"))
+# Same idea, but applied only when the candidate's topic label exactly matches
+# (case-insensitive) a previously approved idea's topic label. Deliberately much
+# lower than DEDUP_SIMILARITY_THRESHOLD -- calibrate_dedup_threshold.py, run against
+# 54 real approved ideas (1431 pairs), found that genuinely-duplicate same-topic
+# pairs scored 0.58-0.75 similarity (never above 0.75, let alone 0.85 -- the general
+# threshold was catching 0% of them), while cross-topic pairs almost never exceeded
+# 0.72. An exact topic-label match is a much stronger and free signal here than
+# embedding similarity alone can provide for short, thematically-clustered
+# motivational copy -- gating a lower threshold on that match costs nothing extra
+# (no new embedding calls) and can't introduce new false positives on genuinely
+# distinct ideas, since it never applies to a different-topic pair.
+DEDUP_SAME_TOPIC_THRESHOLD = float(os.getenv("DEDUP_SAME_TOPIC_THRESHOLD", "0.62"))
 
 
 def load_brand_profile(path: str | Path | None = None) -> BrandProfile:

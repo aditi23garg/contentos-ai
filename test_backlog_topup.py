@@ -19,6 +19,15 @@ PASS, FAIL = "PASS", "FAIL"
 errors: list[str] = []
 total = 0
 
+def fake_run_research(brand, count, recent_topics=None):
+    captured_deficit["requested"] = count
+    ...
+
+class FakeVectorStore:
+    def find_similar(self, text: str, threshold: float, topic: str | None = None, same_topic_threshold: float | None = None):
+        if "ALREADY_APPROVED" in text:
+            return [("some prior approved idea", 0.95)]
+        return []
 
 def check(name: str, condition: bool, detail: str = "") -> None:
     global total

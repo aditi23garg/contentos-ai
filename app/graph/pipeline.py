@@ -99,6 +99,7 @@ def research_node(state: PipelineState) -> dict:
         vector_store=get_vector_store(),
         dedup_threshold=config.DEDUP_SIMILARITY_THRESHOLD,
         batch_size=config.BATCH_SIZE,
+        same_topic_threshold=config.DEDUP_SAME_TOPIC_THRESHOLD,
     )
 
     backlog_summary = f", {len(backlog_ideas)} pulled from backlog" if backlog_ideas else ""
@@ -198,22 +199,22 @@ def persist_batch_node(state: PipelineState) -> dict:
         for result in state["batch_results"]:
             idea = result["idea"]
             if idea.source_backlog_id is not None:
-                update_idea_status(session, idea.source_backlog_id, result["status"])
+                update_idea_status(session, idea.source_backlog_id, result["status"], dedup_note=idea.dedup_note)
                 idea_id = idea.source_backlog_id
             else:
-                idea_record = save_idea(session, idea, status=result["status"])
+                idea_record = save_idea(session, idea, status=result["status"], dedup_note=idea.dedup_note)
                 idea_id = idea_record.id
             save_post(session, idea_id, result["content"], result["guardian_result"])
             if result["status"] == "approved":
-                get_vector_store().add_idea(str(idea_id), idea_text(idea))
+                get_vector_store().add_idea(str(idea_id), idea_text(idea), topic=idea.topic)
 
         for surplus_idea in state.get("surplus", []):
             if surplus_idea.source_backlog_id is None:
-                save_idea(session, surplus_idea, status="backlog")
+                save_idea(session, surplus_idea, status="backlog", dedup_note=surplus_idea.dedup_note)
             # else: backlog-sourced and still surplus -- row is already 'backlog', no-op.
 
         for stale_idea in state.get("stale", []):
-            update_idea_status(session, stale_idea.source_backlog_id, "archived")
+            update_idea_status(session, stale_idea.source_backlog_id, "archived", dedup_note=stale_idea.dedup_note)
 
         for entry in state["decisions"]:
             save_decision(session, entry)

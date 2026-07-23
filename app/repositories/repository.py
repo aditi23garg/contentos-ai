@@ -55,15 +55,21 @@ def get_backlog_ideas(session: Session, limit: int) -> list[Idea]:
     ]
 
 
-def update_idea_status(session: Session, idea_id: int, status: str) -> None:
+def update_idea_status(session: Session, idea_id: int, status: str, dedup_note: str | None = None) -> None:
     """
     Update an existing ideas row in place -- used for backlog-sourced ideas so a
     second cycle updates the original row (to approved/rejected/archived) instead
     of save_idea() inserting a duplicate row for the same idea.
+
+    dedup_note is optional here (unlike save_idea) because not every caller has a
+    fresh one -- e.g. persist_batch_node's stale-archiving pass reuses the note
+    dedup_filter already set on the Idea object earlier in the same cycle.
     """
     record = session.query(IdeaRecord).filter(IdeaRecord.id == idea_id).one_or_none()
     if record is not None:
         record.status = status
+        if dedup_note is not None:
+            record.dedup_note = dedup_note
 
 
 def save_post(
