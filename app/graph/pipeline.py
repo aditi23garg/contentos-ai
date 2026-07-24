@@ -1,17 +1,26 @@
 """
-The Phase-1 pipeline as a LangGraph, now doing real Content Batching per the spec:
+The Phase-1 pipeline as a LangGraph, doing real Content Batching per the spec, now with
+a genuine human approval gate:
 
     Research: pull backlog first (Idea Library top-up), then top up with only as
               many fresh candidates as needed to reach IDEAS_PER_BATCH
         -> Dedup (vs. history) + near-duplicate filter (within this batch)
         -> take top BATCH_SIZE by confidence
         -> for each: Produce -> Guardian (bounded per-item retry) -> record result
-        -> Persist whole batch to SQLite, index approved ideas in ChromaDB
+        -> Persist whole batch to SQLite
 
-This replaces the earlier one-idea-per-run version. The graph still has only one
-conditional edge doing real work (the per-item retry/advance decision) -- looping over
-a queue via state, not a wider agent mesh, per the spec's "linear graph with
-conditional edges" standard.
+A Brand Guardian pass no longer means "approved" -- it means "pending_review": the
+idea moves into the dashboard's review queue (dashboard.py) for a human to actually
+Approve, Reject, or Edit, per the spec's Phase 1 "Approve/Reject/Edit -> Feedback
+capture" step. Only a human Approve indexes the idea in ChromaDB (see
+repository.py's dashboard support functions) -- a Guardian pass alone is not enough
+to affect future dedup/diversity checks. A Guardian fail is still an automatic
+"rejected", per the spec's automatic-rejection rule, though a human can still find
+and override it from the Idea Library view.
+
+The graph still has only one conditional edge doing real work (the per-item
+retry/advance decision) -- looping over a queue via state, not a wider agent mesh,
+per the spec's "linear graph with conditional edges" standard.
 """
 
 from __future__ import annotations
@@ -163,7 +172,12 @@ def bump_item_retry_node(state: PipelineState) -> dict:
 
 def record_result_node(state: PipelineState) -> dict:
     idea = state["queue"][state["queue_index"]]
-    status = "approved" if state["guardian_result"].passed else "rejected"
+    # Brand Guardian passing is no longer the final word -- it moves the idea into
+    # the human review queue (dashboard.py's Pending Review tab). Only a human
+    # Approve click sets status="approved" (see repository.py's dashboard support
+    # functions). A Guardian fail is still terminal here, per the spec's automatic-
+    # rejection rule -- a human can still find it in the Idea Library and override.
+    status = "pending_review" if state["guardian_result"].passed else "rejected"
     result: BatchResult = {
         "idea": idea,
         "content": state["content"],
@@ -204,7 +218,14 @@ def persist_batch_node(state: PipelineState) -> dict:
             else:
                 idea_record = save_idea(session, idea, status=result["status"], dedup_note=idea.dedup_note)
                 idea_id = idea_record.id
-            save_post(session, idea_id, result["content"], result["guardian_result"])
+            save_post(session, idea_id, result["content"], result["guardian_result"], brand_version=state["brand"].version)
+            # NOTE: this pipeline no longer sets status="approved" directly -- a
+            # Guardian pass now lands at "pending_review" (see record_result_node)
+            # and only a human Approve click on the dashboard sets "approved" +
+            # triggers ChromaDB indexing (app/repositories/repository.py's
+            # dashboard support functions + dashboard.py). This branch is kept as
+            # a defensive no-op in case something else ever persists an
+            # already-approved result through this path.
             if result["status"] == "approved":
                 get_vector_store().add_idea(str(idea_id), idea_text(idea), topic=idea.topic)
 
@@ -222,16 +243,16 @@ def persist_batch_node(state: PipelineState) -> dict:
     finally:
         session.close()
 
-    approved = sum(1 for r in state["batch_results"] if r["status"] == "approved")
-    rejected = len(state["batch_results"]) - approved
+    pending_review = sum(1 for r in state["batch_results"] if r["status"] == "pending_review")
+    rejected = len(state["batch_results"]) - pending_review
     backlogged = sum(1 for i in state.get("surplus", []) if i.source_backlog_id is None)
     archived = len(state.get("stale", []))
     backlog_note = f", {backlogged} backlogged" if backlogged else ""
     archive_note = f", {archived} stale backlog archived" if archived else ""
     return {
         "batch_summary": (
-            f"{len(state['batch_results'])} processed, {approved} approved, "
-            f"{rejected} rejected{backlog_note}{archive_note}"
+            f"{len(state['batch_results'])} processed, {pending_review} awaiting human review, "
+            f"{rejected} auto-rejected{backlog_note}{archive_note}"
         )
     }
 

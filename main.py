@@ -1,16 +1,18 @@
 """
-ContentOS AI — Phase 1, Content Batching.
+ContentOS AI — Phase 1, Content Batching + Human Approval Gate.
 
 Runs one full weekly-style batch cycle: Research generates a pool of candidate ideas,
 dedup-filters them against previously approved history (ChromaDB) and against each
 other, takes the top BATCH_SIZE by confidence, and runs each through Content Producer
 -> Brand Guardian (with a bounded per-item retry) before persisting the whole batch to
-SQLite. Prints every item's result plus the full decision log.
+SQLite. A Guardian pass lands in "pending_review", not "approved" -- run dashboard.py
+to actually review, approve, reject, or edit each item.
 
 Usage:
     cp .env.example .env      # fill in GROQ_API_KEY (or set LLM_PROVIDER=ollama)
     pip install -r requirements.txt
     python main.py
+    streamlit run dashboard.py   # review the batch this just produced
 """
 
 from __future__ import annotations
@@ -37,8 +39,9 @@ def _print_batch_item(index: int, result: dict) -> None:
     content = result["content"]
     scores = result["guardian_result"].scores
 
+    label = "PENDING REVIEW" if result["status"] == "pending_review" else result["status"].upper()
     print("\n" + "-" * 60)
-    print(f"[{index}] {result['status'].upper()} — {idea.topic}")
+    print(f"[{index}] {label} — {idea.topic}")
     print("-" * 60)
     print(f"Angle: {idea.angle}")
     print(f"\nCaption:\n{content.caption}")
@@ -63,6 +66,10 @@ def main() -> None:
         _print_batch_item(i, result)
 
     _print_decision_log(final_state["decisions"])
+
+    pending = sum(1 for r in final_state["batch_results"] if r["status"] == "pending_review")
+    if pending:
+        print(f"\n{pending} item(s) awaiting your review — run: streamlit run dashboard.py")
 
 
 if __name__ == "__main__":

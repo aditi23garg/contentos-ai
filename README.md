@@ -16,15 +16,18 @@ Research Agent -> dedup filter -> Content Producer Agent -> Brand Guardian Agent
 ```
 contentos_ai_batching/
 ├── main.py                          # Entry point — runs one full batch cycle
+├── dashboard.py                     # Streamlit dashboard — Approve/Reject/Edit pending items
 ├── probe_guardian.py                # Discrimination probe: tests Guardian scoring range
 ├── test_json_repair.py              # Smoke tests for the hardened JSON parser
 ├── test_backlog_topup.py            # Smoke tests for backlog read-back / archive-on-stale
+├── test_two_tier_dedup.py           # Smoke tests for two-tier dedup threshold
+├── calibrate_dedup_threshold.py     # Calibrate dedup thresholds against real ChromaDB data
 ├── inspect_history.py               # CLI tool to inspect persisted ideas/posts/decisions
 ├── requirements.txt
 ├── .env.example
 ├── data/
 │   ├── brand_profile.json           # "Life Out Loud" brand — versioned, never mutated in place
-│   ├── contentos.db                 # SQLite — ideas, posts, agent_decisions (auto-created)
+│   ├── contentos.db                 # SQLite — ideas, posts, agent_decisions, feedback_edits
 │   └── chroma/                      # ChromaDB vector index for idea dedup (auto-created)
 └── app/
     ├── core/
@@ -34,6 +37,7 @@ contentos_ai_batching/
     ├── providers/
     │   └── llm.py                   # Groq / Ollama provider abstraction (OpenAI-SDK-compatible)
     │                                # Includes hardened _extract_json with state-machine repair
+    │                                # and constrained JSON mode (response_format=json_object)
     ├── agents/
     │   ├── research_agent.py        # Generates niche-locked ideas from LLM knowledge
     │   ├── content_producer_agent.py# Writes caption + image prompt + hashtags + CTA in one call
@@ -41,11 +45,12 @@ contentos_ai_batching/
     │                                #   v2: injects real post history for concrete strategic_fit scoring
     ├── graph/
     │   └── pipeline.py              # LangGraph state machine: research -> produce -> guardian ->
-    │                                # retry loop -> persist batch
+    │                                # retry loop -> persist batch (Guardian pass = pending_review)
     ├── repositories/
-    │   ├── db.py                    # SQLAlchemy models: IdeaRecord, PostRecord, AgentDecisionRecord
-    │   ├── repository.py            # Repository functions — only place translating Pydantic <-> ORM
-    │   └── vector_store.py          # ChromaDB wrapper for idea similarity / dedup
+    │   ├── db.py                    # SQLAlchemy models: IdeaRecord, PostRecord,
+    │   │                            #   AgentDecisionRecord, FeedbackEditRecord
+    │   ├── repository.py            # Repository functions — pipeline + dashboard support
+    │   └── vector_store.py          # ChromaDB wrapper: two-tier dedup, topic metadata
     └── services/
         └── batching.py              # Dedup filter, near-dup filter, top-N ranking, surplus backlog
 ```
@@ -79,6 +84,21 @@ research -> produce -> guardian ---+
   `grammar_clarity`, `strategic_fit`. Pass requires average >= 4.0 and every dimension >= 3.
   If it fails, content is regenerated once (configurable via `MAX_GUARDIAN_RETRIES`)
   before being recorded as rejected.
+
+  **A Brand Guardian pass is no longer the final word.** It moves the idea to
+  `status='pending_review'` — not `approved`. Only a human Approve click in the
+  dashboard sets it to `approved` and indexes it in ChromaDB. This ensures future
+  dedup/diversity checks reflect real editorial decisions, not just automated scoring.
+
+  Status lifecycle in the `ideas` table:
+
+  | Status | Meaning |
+  |---|---|
+  | `pending_review` | Guardian passed — waiting for human Approve / Reject / Edit |
+  | `approved` | Human approved via dashboard — indexed in ChromaDB for future dedup |
+  | `rejected` | Guardian failed (automatic) or human rejected in dashboard |
+  | `backlog` | Survived dedup but below batch cutoff — read back in next cycle |
+  | `archived` | Backlog idea that went stale on a later cycle |
 
 ### 2. Content Batching with Dedup — Two-Tier Threshold
 
@@ -237,9 +257,26 @@ One full batch cycle:
 1. Research Agent generates 8 candidate ideas
 2. Dedup filters against ChromaDB history; near-dup filter removes in-batch siblings
 3. Top 5 by confidence go through Content Producer -> Brand Guardian
-4. All results (approved / rejected) persist to SQLite; surplus ideas saved as backlog
-5. Approved ideas indexed in ChromaDB for future dedup
+4. All results persist to SQLite: Guardian pass → `pending_review`, Guardian fail → `rejected`; surplus ideas saved as backlog
+5. Approved ideas indexed in ChromaDB **only after human approval in the dashboard**
 6. Full decision log printed to console
+7. Run `streamlit run dashboard.py` to review the batch
+
+### Run the dashboard
+
+```bash
+streamlit run dashboard.py
+```
+
+Shows five tabs:
+- **Pending Review** — approve, reject, edit, or regenerate each Guardian-passed item
+- **Idea Library** — browse all ideas by status with dedup notes
+- **Captions & Previews** — platform variants (Instagram / LinkedIn)
+- **Agent Logs** — full agent_decisions history with idea-selection reasoning
+- **Feedback History** — all human edits captured for the Phase 3 Performance Reviewer
+
+Only an Approve click here indexes the idea in ChromaDB — so future dedup and
+diversity checks reflect real editorial decisions, not just Guardian scores.
 
 ### Inspect history
 
@@ -339,9 +376,37 @@ or `DEDUP_SAME_TOPIC_THRESHOLD` against accumulated real data.
 
 ---
 
+## What's Implemented (Sections 7 & 8)
+
+### 7. Human Approval Gate + Streamlit Dashboard (`dashboard.py`)
+
+A Streamlit dashboard replaces the console as the human decision point. Every item
+the Brand Guardian passes lands as `status='pending_review'` — a human must explicitly
+Approve, Reject, Edit, or Regenerate it in the dashboard.
+
+**Tabs:**
+- **Pending Review** — one card per Guardian-passed item with caption, image prompt,
+  platform variants (Instagram / LinkedIn), and rubric scores
+- **Idea Library** — all ideas filterable by status, with `dedup_note` visible
+- **Agent Logs** — full `agent_decisions` history with idea-selection reasoning
+- **Feedback History** — all human edits captured for Phase 3 analysis
+
+Only an Approve click indexes the idea in ChromaDB for future dedup/diversity checks.
+
+### 8. Human Feedback Learning capture (`FeedbackEditRecord`)
+
+Whenever a human edits a post before approving it, the dashboard captures a full
+before/after snapshot in a new `feedback_edits` SQLite table (`FeedbackEditRecord`
+in `db.py`). Each row stores the full `GeneratedContent` JSON before and after the
+edit, plus `edit_type`, `platform`, `reason`, and `brand_version` for Phase 3
+analysis. `save_feedback_edit()` is called *before* `update_post_content()` so both
+snapshots are always preserved.
+
+---
+
 ## What's Next
 
-1. **Streamlit dashboard** — visual review/approve/edit interface replacing console print.
-2. **Scheduler + Publisher** — Phase 2: auto-schedule approved posts and publish via
+1. **Scheduler + Publisher** — Phase 2: auto-schedule approved posts and publish via
    platform APIs.
-3. **Performance Reviewer** — Phase 3: weekly analytics feedback loop.
+2. **Performance Reviewer** — Phase 3: weekly analytics feedback loop using the
+   captured `feedback_edits` data.

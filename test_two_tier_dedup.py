@@ -10,6 +10,7 @@ embedding function, so this exercises the actual add_idea/find_similar code path
 and metadata storage -- not a mock of VectorStore itself -- without needing network
 access to download a real embedding model.
 
+Run with:  python test_two_tier_dedup.py
 """
 
 from __future__ import annotations

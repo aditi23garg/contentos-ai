@@ -8,7 +8,15 @@ persisted (app/repositories/db.py). Nothing outside this module should import th
 from __future__ import annotations
 
 from app.core.schemas import AgentDecisionLog, BrandGuardianResult, GeneratedContent, Idea
-from app.repositories.db import AgentDecisionRecord, IdeaRecord, PostRecord, Session, from_json, to_json
+from app.repositories.db import (
+    AgentDecisionRecord,
+    FeedbackEditRecord,
+    IdeaRecord,
+    PostRecord,
+    Session,
+    from_json,
+    to_json,
+)
 
 
 def save_idea(session: Session, idea: Idea, status: str, dedup_note: str = "") -> IdeaRecord:
@@ -73,7 +81,11 @@ def update_idea_status(session: Session, idea_id: int, status: str, dedup_note: 
 
 
 def save_post(
-    session: Session, idea_id: int, content: GeneratedContent, guardian_result: BrandGuardianResult
+    session: Session,
+    idea_id: int,
+    content: GeneratedContent,
+    guardian_result: BrandGuardianResult,
+    brand_version: int | None = None,
 ) -> PostRecord:
     record = PostRecord(
         idea_id=idea_id,
@@ -86,6 +98,7 @@ def save_post(
         passed=guardian_result.passed,
         rubric_scores=to_json(guardian_result.scores.model_dump()),
         guardian_reason=guardian_result.reason,
+        brand_version=brand_version,
     )
     session.add(record)
     session.flush()
@@ -131,6 +144,12 @@ def get_recent_approved_topics(session: Session, limit: int = 20) -> list[str]:
     Deliberately capped at 20 (roughly 400-500 tokens when injected into the prompt)
     to stay comfortably within LLM_MAX_TOKENS. Raise the cap if you increase
     LLM_MAX_TOKENS and want a deeper history window.
+
+    Note: as of the human-approval-gate change, "approved" here means a human
+    actually clicked Approve on the dashboard -- not just that the Brand Guardian
+    passed it (that intermediate state is "pending_review"). This is intentional:
+    dedup/diversity context should reflect genuinely finalized decisions, not
+    content still sitting in the review queue.
     """
     rows = (
         session.query(IdeaRecord)
@@ -140,3 +159,120 @@ def get_recent_approved_topics(session: Session, limit: int = 20) -> list[str]:
         .all()
     )
     return [f"{r.topic}: {r.angle}" for r in rows]
+
+
+# --- Dashboard support: human approval gate, Idea Library browsing, logs, feedback ---
+
+
+def get_pending_review(session: Session) -> list[tuple[IdeaRecord, PostRecord]]:
+    """
+    The dashboard's main review queue: every idea currently sitting at
+    status='pending_review' (Brand Guardian passed it, no human decision yet),
+    paired with its latest post. Oldest first, so the queue drains in order.
+    """
+    ideas = (
+        session.query(IdeaRecord)
+        .filter(IdeaRecord.status == "pending_review")
+        .order_by(IdeaRecord.created_at.asc())
+        .all()
+    )
+    results = []
+    for idea in ideas:
+        post = (
+            session.query(PostRecord)
+            .filter(PostRecord.idea_id == idea.id)
+            .order_by(PostRecord.created_at.desc())
+            .first()
+        )
+        if post is not None:
+            results.append((idea, post))
+    return results
+
+
+def get_idea_library(session: Session, status: str | None = None, limit: int = 200) -> list[IdeaRecord]:
+    """Idea Library browse view -- optionally filtered to one status, newest first."""
+    query = session.query(IdeaRecord)
+    if status:
+        query = query.filter(IdeaRecord.status == status)
+    return query.order_by(IdeaRecord.created_at.desc()).limit(limit).all()
+
+
+def get_latest_post_for_idea(session: Session, idea_id: int) -> PostRecord | None:
+    return (
+        session.query(PostRecord)
+        .filter(PostRecord.idea_id == idea_id)
+        .order_by(PostRecord.created_at.desc())
+        .first()
+    )
+
+
+def get_agent_logs(session: Session, agent_name: str | None = None, limit: int = 200) -> list[AgentDecisionRecord]:
+    query = session.query(AgentDecisionRecord)
+    if agent_name:
+        query = query.filter(AgentDecisionRecord.agent_name == agent_name)
+    return query.order_by(AgentDecisionRecord.timestamp.desc()).limit(limit).all()
+
+
+def get_feedback_history(session: Session, limit: int = 100) -> list[FeedbackEditRecord]:
+    return (
+        session.query(FeedbackEditRecord)
+        .order_by(FeedbackEditRecord.timestamp.desc())
+        .limit(limit)
+        .all()
+    )
+
+
+def update_post_content(
+    session: Session,
+    post_id: int,
+    caption: str,
+    image_prompt: str,
+    hashtags: list[str],
+    cta: str,
+    platform_variants: dict[str, str],
+) -> PostRecord:
+    """Overwrite a post's editable fields in place -- used by the dashboard's Edit
+    action. The pre-edit values should be captured via save_feedback_edit BEFORE
+    calling this, since this overwrites them."""
+    record = session.query(PostRecord).filter(PostRecord.id == post_id).one()
+    record.caption = caption
+    record.image_prompt = image_prompt
+    record.hashtags = to_json(hashtags)
+    record.cta = cta
+    record.platform_variants = to_json(platform_variants)
+    return record
+
+
+def save_feedback_edit(
+    session: Session,
+    idea_id: int,
+    post_id: int,
+    topic: str,
+    edit_type: str,
+    original_output: dict,
+    edited_output: dict,
+    brand_version: int | None = None,
+    platform: str = "primary",
+    reason: str | None = None,
+) -> FeedbackEditRecord:
+    """
+    Human Feedback Learning, Phase 1 capture. Call this BEFORE update_post_content
+    overwrites the post row, passing the full pre-edit and post-edit content dicts
+    (e.g. GeneratedContent.model_dump()) so both snapshots are preserved -- Phase 3's
+    Performance Reviewer Agent needs the full before/after to mine style patterns
+    later, not just a diff of one field.
+    """
+    record = FeedbackEditRecord(
+        idea_id=idea_id,
+        post_id=post_id,
+        topic=topic,
+        platform=platform,
+        edit_type=edit_type,
+        original_output=to_json(original_output),
+        edited_output=to_json(edited_output),
+        reason=reason,
+        brand_version=brand_version,
+    )
+    session.add(record)
+    session.flush()
+    return record

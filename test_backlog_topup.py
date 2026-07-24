@@ -97,16 +97,6 @@ check("T2b status actually changed", updated_status == "approved")
 print("\n=== batching: stale backlog detection ===\n")
 
 
-class FakeVectorStore:
-    """Deterministic stand-in for ChromaDB -- flags any idea whose topic contains
-    'ALREADY_APPROVED' as matching history, everything else as fresh."""
-
-    def find_similar(self, text: str, threshold: float):
-        if "ALREADY_APPROVED" in text:
-            return [("some prior approved idea", 0.95)]
-        return []
-
-
 backlog_now_stale = Idea(
     topic="ALREADY_APPROVED topic",
     angle="x",
