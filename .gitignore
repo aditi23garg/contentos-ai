@@ -7,3 +7,8 @@ venv/
 # Local persistence -- generated at runtime, not source
 data/contentos.db
 data/chroma/
+
+# Throwaway SQLite files created by the test_*.py scripts (test_backlog_topup.py,
+# test_human_approval_gate.py, etc. each spin up their own isolated data/_test_*.db
+# via reset_for_testing()) -- never meant to be committed.
+data/_test_*.db
